@@ -139,7 +139,7 @@ type ConfigLocal struct {
 	// metadataVersion is the version to use when creating new metadata.
 	metadataVersion kbfsmd.MetadataVer
 
-	mode InitMode
+	mode InitModeType
 
 	quotaUsage      map[keybase1.UserOrTeamID]*EventuallyConsistentQuotaUsage
 	rekeyFSMLimiter *OngoingWorkLimiter
@@ -370,7 +370,7 @@ func getDefaultCleanBlockCacheCapacity() uint64 {
 //
 // TODO: Now that NewConfigLocal takes loggerFn, add more default
 // components.
-func NewConfigLocal(mode InitMode, loggerFn func(module string) logger.Logger,
+func NewConfigLocal(mode InitModeType, loggerFn func(module string) logger.Logger,
 	storageRoot string, diskCacheMode DiskCacheMode, kbCtx Context) *ConfigLocal {
 	config := &ConfigLocal{
 		loggerFn:      loggerFn,
@@ -852,7 +852,7 @@ func (c *ConfigLocal) SetRekeyWithPromptWaitTime(d time.Duration) {
 }
 
 // Mode implements the Config interface for ConfigLocal.
-func (c *ConfigLocal) Mode() InitMode {
+func (c *ConfigLocal) Mode() InitModeType {
 	// We return the mode with the test flag masked out.
 	return c.mode.Mode()
 }

@@ -1767,6 +1767,15 @@ type Tracer interface {
 	MaybeFinishTrace(ctx context.Context, err error)
 }
 
+// InitMode encapsulates mode differences.
+type InitMode interface {
+	fmt.Stringer
+
+	Type() InitModeType
+	BlockWorkers() int
+	PrefetchWorkers() int
+}
+
 type initModeGetter interface {
 	// Mode indicates how KBFS is configured to run.
 	Mode() InitMode

@@ -429,7 +429,7 @@ func getFileBlockForMD(ctx context.Context, bcache BlockCache, bops BlockOps,
 }
 
 func reembedBlockChanges(ctx context.Context, codec kbfscodec.Codec,
-	bcache BlockCache, bops BlockOps, mode InitMode, tlfID tlf.ID,
+	bcache BlockCache, bops BlockOps, mode InitModeType, tlfID tlf.ID,
 	pmd *PrivateMetadata, rmdWithKeys KeyMetadata, log logger.Logger) error {
 	info := pmd.Changes.Info
 	if info.BlockPointer == zeroPtr {
@@ -495,7 +495,7 @@ func reembedBlockChanges(ctx context.Context, codec kbfscodec.Codec,
 // decryptMDPrivateData does not use uid if the handle is a public one.
 func decryptMDPrivateData(ctx context.Context, codec kbfscodec.Codec,
 	crypto Crypto, bcache BlockCache, bops BlockOps,
-	keyGetter mdDecryptionKeyGetter, mode InitMode, uid keybase1.UID,
+	keyGetter mdDecryptionKeyGetter, mode InitModeType, uid keybase1.UID,
 	serializedPrivateMetadata []byte,
 	rmdToDecrypt, rmdWithKeys KeyMetadata, log logger.Logger) (
 	PrivateMetadata, error) {

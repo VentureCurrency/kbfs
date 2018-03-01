@@ -5682,9 +5682,9 @@ func (m *MockinitModeGetter) EXPECT() *MockinitModeGetterMockRecorder {
 }
 
 // Mode mocks base method
-func (m *MockinitModeGetter) Mode() InitMode {
+func (m *MockinitModeGetter) Mode() InitModeType {
 	ret := m.ctrl.Call(m, "Mode")
-	ret0, _ := ret[0].(InitMode)
+	ret0, _ := ret[0].(InitModeType)
 	return ret0
 }
 
@@ -5921,9 +5921,9 @@ func (mr *MockConfigMockRecorder) SetTlfSyncState(tlfID, isSynced interface{}) *
 }
 
 // Mode mocks base method
-func (m *MockConfig) Mode() InitMode {
+func (m *MockConfig) Mode() InitModeType {
 	ret := m.ctrl.Call(m, "Mode")
-	ret0, _ := ret[0].(InitMode)
+	ret0, _ := ret[0].(InitModeType)
 	return ret0
 }
 
