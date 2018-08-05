@@ -403,7 +403,7 @@ func ImportStatusAsError(g *GlobalContext, s *keybase1.Status) error {
 	case SCNotFound:
 		return NotFoundError{Msg: s.Desc}
 	case SCDeleted:
-		return DeletedError{Msg: s.Desc}
+		return UserDeletedError{Msg: s.Desc}
 	case SCDecryptionError:
 		return DecryptionError{}
 	case SCKeyRevoked:
@@ -675,6 +675,27 @@ func ImportStatusAsError(g *GlobalContext, s *keybase1.Status) error {
 		}
 		if s.Code == SCTeamProvisionalCanKey {
 			e.CanKey = true
+		}
+		return e
+	case SCEphemeralPairwiseMACsMissingUIDs:
+		e := EphemeralPairwiseMACsMissingUIDsError{}
+		uids := []keybase1.UID{}
+		for _, field := range s.Fields {
+			uids = append(uids, keybase1.UID(field.Value))
+		}
+		e.UIDs = uids
+		return e
+	case SCMerkleClientError:
+		e := MerkleClientError{m: s.Desc}
+		for _, field := range s.Fields {
+			if field.Key == "type" {
+				i, err := strconv.Atoi(field.Value)
+				if err != nil {
+					g.Log.Warning("error parsing merkle error type: %s", err)
+				} else {
+					e.t = merkleClientErrorType(i)
+				}
+			}
 		}
 		return e
 	default:
@@ -1101,7 +1122,7 @@ func publicKeyV2BaseFromComputedKeyInfo(kid keybase1.KID, info ComputedKeyInfo) 
 				HashMeta: info.RevokedAtHashMeta,
 				Seqno:    keybase1.Seqno(info.RevokedAt.Chain),
 			},
-			FirstAppearedUnverified: info.FirstAppearedUnverified,
+			FirstAppearedUnverified: info.RevokeFirstAppearedUnverified,
 			SigningKID:              info.RevokedBy,
 		}
 		if info.RevokedAtSigChainLocation != nil {
@@ -1316,7 +1337,7 @@ func (p PerUserKeysList) Len() int           { return len(p) }
 func (p PerUserKeysList) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 func (p PerUserKeysList) Less(i, j int) bool { return p[i].Gen < p[j].Gen }
 
-func (cki *ComputedKeyInfos) exportUPKV2Incarnation(uid keybase1.UID, username string, eldestSeqno keybase1.Seqno, kf *KeyFamily, status keybase1.StatusCode) keybase1.UserPlusKeysV2 {
+func (cki *ComputedKeyInfos) exportUPKV2Incarnation(uid keybase1.UID, username string, eldestSeqno keybase1.Seqno, kf *KeyFamily, status keybase1.StatusCode, reset *keybase1.ResetSummary) keybase1.UserPlusKeysV2 {
 
 	var perUserKeysList PerUserKeysList
 	if cki != nil {
@@ -1346,6 +1367,7 @@ func (cki *ComputedKeyInfos) exportUPKV2Incarnation(uid keybase1.UID, username s
 		DeviceKeys:  deviceKeys,
 		PGPKeys:     pgpSummaries,
 		Status:      status,
+		Reset:       reset,
 		// Uvv and RemoteTracks are set later, and only for the current incarnation
 	}
 }
@@ -1359,6 +1381,16 @@ func (u *User) ExportToUPKV2AllIncarnations() (*keybase1.UserPlusKeysV2AllIncarn
 	name := u.GetName()
 	status := u.GetStatus()
 
+	// Make a map of EldestKID -> ResetSummary for all resets
+
+	resetMap := make(map[keybase1.Seqno](*keybase1.ResetSummary))
+	if resets := u.leaf.resets; resets != nil {
+		for _, l := range resets.chain {
+			tmp := l.Summarize()
+			resetMap[l.Prev.LastSeqno] = &tmp
+		}
+	}
+
 	// First assemble all the past versions of this user.
 	pastIncarnations := []keybase1.UserPlusKeysV2{}
 	if u.sigChain() != nil {
@@ -1366,18 +1398,29 @@ func (u *User) ExportToUPKV2AllIncarnations() (*keybase1.UserPlusKeysV2AllIncarn
 			if len(subchain) == 0 {
 				return nil, fmt.Errorf("Tried to export empty subchain for uid %s username %s", u.GetUID(), u.GetName())
 			}
-			cki := subchain[len(subchain)-1].cki
-			pastIncarnations = append(pastIncarnations, cki.exportUPKV2Incarnation(uid, name, subchain[0].GetSeqno(), kf, status))
+			lastLink := subchain[len(subchain)-1]
+			cki := lastLink.cki
+			eldestSeqno := subchain[0].GetSeqno()
+			lastSeqno := lastLink.GetSeqno()
+			reset := resetMap[lastSeqno]
+			if reset != nil {
+				reset.EldestSeqno = eldestSeqno
+			}
+			pastIncarnations = append(pastIncarnations, cki.exportUPKV2Incarnation(uid, name, eldestSeqno, kf, status, reset))
 		}
 	}
 
 	// Then assemble the current version. This one gets a couple extra fields, Uvv and RemoteTracks.
-	current := u.GetComputedKeyInfos().exportUPKV2Incarnation(uid, name, u.GetCurrentEldestSeqno(), kf, status)
+	current := u.GetComputedKeyInfos().exportUPKV2Incarnation(uid, name, u.GetCurrentEldestSeqno(), kf, status, nil)
 	current.RemoteTracks = make(map[keybase1.UID]keybase1.RemoteTrack)
 	if u.IDTable() != nil {
 		for _, track := range u.IDTable().GetTrackList() {
 			current.RemoteTracks[track.whomUID] = track.Export()
 		}
+	}
+	if accountID := u.StellarAccountID(); accountID != nil {
+		tmp := accountID.String()
+		current.StellarAccountID = &tmp
 	}
 
 	// Collect the link IDs (that is, the hashes of the signature inputs) from all subchains.
@@ -1817,7 +1860,7 @@ func (e NotFoundError) ToStatus() keybase1.Status {
 	}
 }
 
-func (e DeletedError) ToStatus() keybase1.Status {
+func (e UserDeletedError) ToStatus() keybase1.Status {
 	return keybase1.Status{
 		Code: SCDeleted,
 		Name: "SC_DELETED",
@@ -2231,5 +2274,25 @@ func (e TeamProvisionalError) ToStatus() keybase1.Status {
 	if e.IsPublic {
 		ret.Fields = append(ret.Fields, keybase1.StringKVPair{Key: "IsPublic", Value: "1"})
 	}
+	return ret
+}
+
+func (e EphemeralPairwiseMACsMissingUIDsError) ToStatus() (ret keybase1.Status) {
+	ret.Code = SCEphemeralPairwiseMACsMissingUIDs
+	ret.Name = "EPHEMERAL_PAIRWISE_MACS_MISSING_UIDS"
+	for _, uid := range e.UIDs {
+		ret.Fields = append(ret.Fields, keybase1.StringKVPair{
+			Key:   "uid",
+			Value: uid.String(),
+		})
+	}
+	return ret
+}
+
+func (e MerkleClientError) ToStatus() (ret keybase1.Status) {
+	ret.Code = SCMerkleClientError
+	ret.Name = "MERKLE_CLIENT_ERROR"
+	ret.Fields = append(ret.Fields, keybase1.StringKVPair{Key: "type", Value: fmt.Sprintf("%d", int(e.t))})
+	ret.Desc = e.m
 	return ret
 }

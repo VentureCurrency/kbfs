@@ -733,8 +733,9 @@ func (km *KeyManagerStandard) Rekey(ctx context.Context, md *RootMetadata, promp
 	if !md.IsReadable() && len(md.GetSerializedPrivateMetadata()) > 0 {
 		pmd, err := decryptMDPrivateData(
 			ctx, km.config.Codec(), km.config.Crypto(),
-			km.config.BlockCache(), km.config.BlockOps(), km, km.config.Mode(),
-			session.UID, md.GetSerializedPrivateMetadata(), md, md, km.log)
+			km.config.BlockCache(), km.config.BlockOps(), km, km.config.KBPKI(),
+			km.config.Mode(), session.UID, md.GetSerializedPrivateMetadata(),
+			md, md, km.log)
 		if err != nil {
 			return false, nil, err
 		}
@@ -818,7 +819,7 @@ func (km *KeyManagerStandard) Rekey(ctx context.Context, md *RootMetadata, promp
 			}
 			for key, serverHalfIDs := range userRemovalInfo.DeviceServerHalfIDs {
 				km.log.CInfof(ctx, "Rekey %s: removing %d server key halves "+
-					" for device %s of user %s", md.TlfID(),
+					"for device %s of user %s", md.TlfID(),
 					len(serverHalfIDs), key, uid)
 				for _, serverHalfID := range serverHalfIDs {
 					err := kops.DeleteTLFCryptKeyServerHalf(

@@ -59,16 +59,15 @@ type PGPFingerprint [PGPFingerprintLen]byte
 
 func PGPFingerprintFromHex(s string) (*PGPFingerprint, error) {
 	var fp PGPFingerprint
-	n, err := hex.Decode([]byte(fp[:]), []byte(s))
-	var ret *PGPFingerprint
-	if err != nil {
-		// Noop
-	} else if n != PGPFingerprintLen {
-		err = fmt.Errorf("Bad fingerprint; wrong length: %d", n)
-	} else {
-		ret = &fp
+	err := DecodeHexFixed(fp[:], []byte(s))
+	switch err.(type) {
+	case nil:
+		return &fp, nil
+	case HexWrongLengthError:
+		return nil, fmt.Errorf("Bad fingerprint; wrong length: %d", len(s))
+	default:
+		return nil, err
 	}
-	return ret, err
 }
 
 func PGPFingerprintFromSlice(b []byte) (*PGPFingerprint, error) {
@@ -172,7 +171,7 @@ func (k *PGPKeyBundle) StripRevocations() (strippedKey *PGPKeyBundle) {
 	strippedKey.Subkeys = nil
 	for _, subkey := range oldSubkeys {
 		// Skip revoked subkeys
-		if subkey.Sig.SigType == packet.SigTypeSubkeyBinding {
+		if subkey.Sig.SigType == packet.SigTypeSubkeyBinding && subkey.Revocation == nil {
 			strippedKey.Subkeys = append(strippedKey.Subkeys, subkey)
 		}
 	}
@@ -558,14 +557,17 @@ func (k PGPKeyBundle) GetPrimaryUID() string {
 	return s
 }
 
+// HasSecretKey checks if the PGPKeyBundle contains secret key. This
+// function returning true does not indicate that the key is
+// functional - it may also be a key stub.
 func (k *PGPKeyBundle) HasSecretKey() bool {
 	return k.PrivateKey != nil
 }
 
-// findPGPPrivateKey checks if supposed secret key PGPKeyBundle
+// FindPGPPrivateKey checks if supposed secret key PGPKeyBundle
 // contains any valid PrivateKey entities. Sometimes primary private
-// key is stupped out but there are subkeys with secret keys.
-func findPGPPrivateKey(k *PGPKeyBundle) bool {
+// key is stoopped out but there are subkeys with secret keys.
+func FindPGPPrivateKey(k *PGPKeyBundle) bool {
 	if k.PrivateKey.PrivateKey != nil {
 		return true
 	}
@@ -584,7 +586,7 @@ func (k *PGPKeyBundle) CheckSecretKey() (err error) {
 		err = NoSecretKeyError{}
 	} else if k.PrivateKey.Encrypted {
 		err = BadKeyError{"PGP key material should be unencrypted"}
-	} else if !findPGPPrivateKey(k) && k.GPGFallbackKey == nil {
+	} else if !FindPGPPrivateKey(k) && k.GPGFallbackKey == nil {
 		err = BadKeyError{"no private key material or GPGKey"}
 	}
 	return
@@ -704,9 +706,9 @@ func (k *PGPKeyBundle) unlockAllPrivateKeys(pw string) error {
 	return nil
 }
 
-func (k *PGPKeyBundle) Unlock(g *GlobalContext, reason string, secretUI SecretUI) error {
+func (k *PGPKeyBundle) Unlock(m MetaContext, reason string, secretUI SecretUI) error {
 	if !k.isAnyKeyEncrypted() {
-		g.Log.Debug("Key is not encrypted, skipping Unlock.")
+		m.CDebugf("Key is not encrypted, skipping Unlock.")
 		return nil
 	}
 
@@ -717,7 +719,7 @@ func (k *PGPKeyBundle) Unlock(g *GlobalContext, reason string, secretUI SecretUI
 		return k, nil
 	}
 
-	_, err := NewKeyUnlocker(g, 5, reason, k.VerboseDescription(), PassphraseTypePGP, false, secretUI, unlocker).Run()
+	_, err := NewKeyUnlocker(5, reason, k.VerboseDescription(), PassphraseTypePGP, false, secretUI, unlocker).Run(m)
 	return err
 }
 

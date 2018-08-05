@@ -464,6 +464,14 @@ func (a AppStatusError) Error() string {
 	return fmt.Sprintf("%s%s (error %d)", a.Desc, fields, a.Code)
 }
 
+func IsAppStatusErrorCode(err error, code keybase1.StatusCode) bool {
+	switch err := err.(type) {
+	case AppStatusError:
+		return err.Code == int(code)
+	}
+	return false
+}
+
 //=============================================================================
 
 type GpgError struct {
@@ -558,7 +566,7 @@ type LoggedInWrongUserError struct {
 }
 
 func (e LoggedInWrongUserError) Error() string {
-	return fmt.Sprintf("Logged in as %q, attempting to log in as %q:  try logout first", e.ExistingName, e.AttemptedName)
+	return fmt.Sprintf("Logged in as %q, attempting to log in as %q: try logout first", e.ExistingName, e.AttemptedName)
 }
 
 //=============================================================================
@@ -699,6 +707,8 @@ func (e NoUsernameError) Error() string {
 	return "No username known"
 }
 
+func NewNoUsernameError() NoUsernameError { return NoUsernameError{} }
+
 //=============================================================================
 
 type UnmarshalError struct {
@@ -807,17 +817,26 @@ func (d DecryptWrongReceiverError) Error() string {
 	return "Bad receiver key"
 }
 
-type DecryptOpenError struct{}
+type DecryptOpenError struct {
+	What string
+}
+
+func NewDecryptOpenError(what string) DecryptOpenError {
+	return DecryptOpenError{What: what}
+}
 
 func (d DecryptOpenError) Error() string {
-	return "box.Open failure; ciphertext was corrupted or wrong key"
+	if len(d.What) == 0 {
+		return "box.Open failure; ciphertext was corrupted or wrong key"
+	}
+	return fmt.Sprintf("failed to decrypt '%s'; ciphertext was corrupted or wrong key", d.What)
 }
 
 //=============================================================================
 
-type NoConfigFile struct{}
+type NoConfigFileError struct{}
 
-func (n NoConfigFile) Error() string {
+func (n NoConfigFileError) Error() string {
 	return "No configuration file available"
 }
 
@@ -964,10 +983,18 @@ func (u UIDMismatchError) Error() string {
 	return fmt.Sprintf("UID mismatch error: %s", u.Msg)
 }
 
+func NewUIDMismatchError(m string) UIDMismatchError {
+	return UIDMismatchError{Msg: m}
+}
+
 //=============================================================================
 
 type KeyRevokedError struct {
 	msg string
+}
+
+func NewKeyRevokedError(m string) KeyRevokedError {
+	return KeyRevokedError{m}
 }
 
 func (r KeyRevokedError) Error() string {
@@ -1012,6 +1039,14 @@ func (c ChainLinkError) Error() string {
 	return fmt.Sprintf("Error in parsing chain Link: %s", c.msg)
 }
 
+type ChainLinkStubbedUnsupportedError struct {
+	msg string
+}
+
+func (c ChainLinkStubbedUnsupportedError) Error() string {
+	return c.msg
+}
+
 type SigchainV2Error struct {
 	msg string
 }
@@ -1044,6 +1079,18 @@ type SigchainV2MismatchedHashError struct{}
 
 func (s SigchainV2MismatchedHashError) Error() string {
 	return "Sigchain V2 hash mismatch error"
+}
+
+type SigchainV2StubbedDisallowed struct{}
+
+func (s SigchainV2StubbedDisallowed) Error() string {
+	return "Link was stubbed but required"
+}
+
+type SigchainV2Required struct{}
+
+func (s SigchainV2Required) Error() string {
+	return "Link must use sig v2"
 }
 
 //=============================================================================
@@ -1105,6 +1152,17 @@ const (
 	merkleErrorNoLeftBookend
 	merkleErrorNoRightBookend
 	merkleErrorHashMeta
+	merkleErrorBadResetChain
+	merkleErrorNotFound
+	merkleErrorBadSeqno
+	merkleErrorBadLeaf
+	merkleErrorNoUpdates
+	merkleErrorBadSigID
+	merkleErrorAncientSeqno
+	merkleErrorKBFSBadTree
+	merkleErrorKBFSMismatch
+	merkleErrorBadRoot
+	merkleErrorOldTree
 )
 
 type MerkleClientError struct {
@@ -1116,12 +1174,20 @@ func (m MerkleClientError) Error() string {
 	return fmt.Sprintf("Error checking merkle tree: %s", m.m)
 }
 
-type MerkleNotFoundError struct {
+func (m MerkleClientError) IsNotFound() bool {
+	return m.t == merkleErrorNotFound
+}
+
+func (m MerkleClientError) IsOldTree() bool {
+	return m.t == merkleErrorOldTree
+}
+
+type MerklePathNotFoundError struct {
 	k   string
 	msg string
 }
 
-func (m MerkleNotFoundError) Error() string {
+func (m MerklePathNotFoundError) Error() string {
 	return fmt.Sprintf("For key '%s', Merkle path not found: %s", m.k, m.msg)
 }
 
@@ -1177,6 +1243,10 @@ func (e SkipSecretPromptError) Error() string {
 
 type NoDeviceError struct {
 	Reason string
+}
+
+func NewNoDeviceError(s string) NoDeviceError {
+	return NoDeviceError{s}
 }
 
 func (e NoDeviceError) Error() string {
@@ -1688,16 +1758,19 @@ func (e UnhandledSignatureError) Error() string {
 	return fmt.Sprintf("unhandled signature version: %d", e.version)
 }
 
-type DeletedError struct {
+type UserDeletedError struct {
 	Msg string
 }
 
-func (e DeletedError) Error() string {
+func (e UserDeletedError) Error() string {
 	if len(e.Msg) == 0 {
-		return "Deleted"
+		return "User deleted"
 	}
 	return e.Msg
 }
+
+// Keep the previous name around until KBFS revendors and updates.
+type DeletedError = UserDeletedError
 
 //=============================================================================
 
@@ -1810,6 +1883,10 @@ func (e ChatBadMsgError) Error() string {
 	return e.Msg
 }
 
+func (e ChatBadMsgError) IsImmediateFail() (chat1.OutboxErrorType, bool) {
+	return chat1.OutboxErrorType_MISC, true
+}
+
 //=============================================================================
 
 type ChatBroadcastError struct {
@@ -1841,6 +1918,10 @@ func (e ChatAlreadySupersededError) Error() string {
 	return e.Msg
 }
 
+func (e ChatAlreadySupersededError) IsImmediateFail() (chat1.OutboxErrorType, bool) {
+	return chat1.OutboxErrorType_MISC, true
+}
+
 //=============================================================================
 
 type ChatAlreadyDeletedError struct {
@@ -1849,6 +1930,10 @@ type ChatAlreadyDeletedError struct {
 
 func (e ChatAlreadyDeletedError) Error() string {
 	return e.Msg
+}
+
+func (e ChatAlreadyDeletedError) IsImmediateFail() (chat1.OutboxErrorType, bool) {
+	return chat1.OutboxErrorType_ALREADY_DELETED, true
 }
 
 //=============================================================================
@@ -1871,6 +1956,10 @@ func (e ChatDuplicateMessageError) Error() string {
 	return fmt.Sprintf("duplicate message send: outboxID: %s", e.OutboxID)
 }
 
+func (e ChatDuplicateMessageError) IsImmediateFail() (chat1.OutboxErrorType, bool) {
+	return chat1.OutboxErrorType_DUPLICATE, true
+}
+
 //=============================================================================
 
 type ChatClientError struct {
@@ -1879,6 +1968,10 @@ type ChatClientError struct {
 
 func (e ChatClientError) Error() string {
 	return fmt.Sprintf("error from chat server: %s", e.Msg)
+}
+
+func (e ChatClientError) IsImmediateFail() (chat1.OutboxErrorType, bool) {
+	return chat1.OutboxErrorType_MISC, true
 }
 
 //=============================================================================
@@ -2155,7 +2248,7 @@ func UserErrorFromStatus(s keybase1.StatusCode) error {
 	case keybase1.StatusCode_SCOk:
 		return nil
 	case keybase1.StatusCode_SCDeleted:
-		return DeletedError{}
+		return UserDeletedError{}
 	default:
 		return &APIError{Code: int(s), Msg: "user status error"}
 	}
@@ -2265,6 +2358,35 @@ func (e TeamProvisionalError) Error() string {
 
 func NewTeamProvisionalError(canKey bool, isPublic bool, dn string) error {
 	return TeamProvisionalError{canKey, isPublic, dn}
+}
+
+//=============================================================================
+
+type NoActiveDeviceError struct{}
+
+func (e NoActiveDeviceError) Error() string { return "no active device" }
+
+//=============================================================================
+
+type NoTriplesecError struct{}
+
+func (e NoTriplesecError) Error() string { return "No Triplesec was available after prompt" }
+func NewNoTriplesecError() error         { return NoTriplesecError{} }
+
+//=============================================================================
+
+type HexWrongLengthError struct{ msg string }
+
+func NewHexWrongLengthError(msg string) HexWrongLengthError { return HexWrongLengthError{msg} }
+
+func (e HexWrongLengthError) Error() string { return e.msg }
+
+//=============================================================================
+
+type EphemeralPairwiseMACsMissingUIDsError struct{ UIDs []keybase1.UID }
+
+func (e EphemeralPairwiseMACsMissingUIDsError) Error() string {
+	return fmt.Sprintf("Missing %d uids from pairwise macs", len(e.UIDs))
 }
 
 //=============================================================================

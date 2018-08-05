@@ -80,7 +80,7 @@ func (nc *newConfigger) shutdown(t *testing.T, ctx context.Context) {
 }
 
 func (nc *newConfigger) getNewConfigForTestWithMode(
-	ctx context.Context, mode libkbfs.InitMode) (
+	ctx context.Context, mode libkbfs.InitModeType) (
 	newCtx context.Context, gitConfig libkbfs.Config,
 	tempDir string, err error) {
 	ctx, err = libkbfs.NewContextWithCancellationDelayer(ctx)
@@ -185,7 +185,7 @@ func TestAutogitManager(t *testing.T) {
 		ctx, config.KBPKI(), config.MDOps(), "user1", tlf.Private)
 	require.NoError(t, err)
 	rootFS, err := libfs.NewFS(
-		ctx, config, h, "", "", keybase1.MDPriorityNormal)
+		ctx, config, h, libkbfs.MasterBranch, "", "", keybase1.MDPriorityNormal)
 	require.NoError(t, err)
 
 	t.Log("Init a new repo directly into KBFS.")

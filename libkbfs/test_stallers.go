@@ -7,6 +7,7 @@ package libkbfs
 import (
 	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/kbfs/kbfsblock"
@@ -30,18 +31,20 @@ const (
 	StallableBlockGet StallableBlockOp = "Get"
 	StallableBlockPut StallableBlockOp = "Put"
 
-	StallableMDGetForTLF             StallableMDOp = "GetForTLF"
-	StallableMDGetLatestHandleForTLF StallableMDOp = "GetLatestHandleForTLF"
-	StallableMDGetUnmergedForTLF     StallableMDOp = "GetUnmergedForTLF"
-	StallableMDGetRange              StallableMDOp = "GetRange"
-	StallableMDAfterGetRange         StallableMDOp = "AfterGetRange"
-	StallableMDGetUnmergedRange      StallableMDOp = "GetUnmergedRange"
-	StallableMDPut                   StallableMDOp = "Put"
-	StallableMDAfterPut              StallableMDOp = "AfterPut"
-	StallableMDPutUnmerged           StallableMDOp = "PutUnmerged"
-	StallableMDAfterPutUnmerged      StallableMDOp = "AfterPutUnmerged"
-	StallableMDPruneBranch           StallableMDOp = "PruneBranch"
-	StallableMDResolveBranch         StallableMDOp = "ResolveBranch"
+	StallableMDGetForTLF                    StallableMDOp = "GetForTLF"
+	StallableMDGetForTLFByTime              StallableMDOp = "GetForTLFByTime"
+	StallableMDGetLatestHandleForTLF        StallableMDOp = "GetLatestHandleForTLF"
+	StallableMDValidateLatestHandleNotFinal StallableMDOp = "ValidateLatestHandleNotFinal"
+	StallableMDGetUnmergedForTLF            StallableMDOp = "GetUnmergedForTLF"
+	StallableMDGetRange                     StallableMDOp = "GetRange"
+	StallableMDAfterGetRange                StallableMDOp = "AfterGetRange"
+	StallableMDGetUnmergedRange             StallableMDOp = "GetUnmergedRange"
+	StallableMDPut                          StallableMDOp = "Put"
+	StallableMDAfterPut                     StallableMDOp = "AfterPut"
+	StallableMDPutUnmerged                  StallableMDOp = "PutUnmerged"
+	StallableMDAfterPutUnmerged             StallableMDOp = "AfterPutUnmerged"
+	StallableMDPruneBranch                  StallableMDOp = "PruneBranch"
+	StallableMDResolveBranch                StallableMDOp = "ResolveBranch"
 )
 
 type stallKeyType uint64
@@ -423,6 +426,18 @@ func (m *stallingMDOps) GetForTLF(ctx context.Context, id tlf.ID,
 	return md, err
 }
 
+func (m *stallingMDOps) GetForTLFByTime(
+	ctx context.Context, id tlf.ID, serverTime time.Time) (
+	md ImmutableRootMetadata, err error) {
+	m.maybeStall(ctx, StallableMDGetForTLFByTime)
+	err = runWithContextCheck(ctx, func(ctx context.Context) error {
+		var errGetForTLF error
+		md, errGetForTLF = m.delegate.GetForTLFByTime(ctx, id, serverTime)
+		return errGetForTLF
+	})
+	return md, err
+}
+
 func (m *stallingMDOps) GetLatestHandleForTLF(ctx context.Context, id tlf.ID) (
 	h tlf.Handle, err error) {
 	m.maybeStall(ctx, StallableMDGetLatestHandleForTLF)
@@ -433,6 +448,18 @@ func (m *stallingMDOps) GetLatestHandleForTLF(ctx context.Context, id tlf.ID) (
 		return errGetLatestHandleForTLF
 	})
 	return h, err
+}
+
+func (m *stallingMDOps) ValidateLatestHandleNotFinal(
+	ctx context.Context, h *TlfHandle) (b bool, err error) {
+	m.maybeStall(ctx, StallableMDValidateLatestHandleNotFinal)
+	err = runWithContextCheck(ctx, func(ctx context.Context) error {
+		var errValidateLatestHandleNotFinal error
+		b, errValidateLatestHandleNotFinal =
+			m.delegate.ValidateLatestHandleNotFinal(ctx, h)
+		return errValidateLatestHandleNotFinal
+	})
+	return b, err
 }
 
 func (m *stallingMDOps) GetUnmergedForTLF(ctx context.Context, id tlf.ID,

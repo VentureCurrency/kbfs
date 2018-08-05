@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"golang.org/x/net/context"
 
@@ -165,6 +166,7 @@ type KeybaseDaemonLocal struct {
 	implicitAsserts    map[string]keybase1.TeamID
 	favoriteStore      favoriteStore
 	merkleRoot         keybase1.MerkleRootV2
+	merkleTime         time.Time
 }
 
 var _ KeybaseService = &KeybaseDaemonLocal{}
@@ -431,7 +433,8 @@ func (k *KeybaseDaemonLocal) LoadUserPlusKeys(ctx context.Context,
 
 // LoadTeamPlusKeys implements KeybaseDaemon for KeybaseDaemonLocal.
 func (k *KeybaseDaemonLocal) LoadTeamPlusKeys(
-	ctx context.Context, tid keybase1.TeamID, _ kbfsmd.KeyGen, _ keybase1.UserVersion,
+	ctx context.Context, tid keybase1.TeamID, _ tlf.Type, _ kbfsmd.KeyGen,
+	_ keybase1.UserVersion, _ kbfscrypto.VerifyingKey,
 	_ keybase1.TeamRole) (TeamInfo, error) {
 	if err := checkContext(ctx); err != nil {
 		return TeamInfo{}, err
@@ -492,33 +495,31 @@ func (k *KeybaseDaemonLocal) GetTeamSettings(
 	return k.localTeamSettings[teamID], nil
 }
 
-// LoadUnverifiedKeys implements KeybaseDaemon for KeybaseDaemonLocal.
-func (k *KeybaseDaemonLocal) LoadUnverifiedKeys(ctx context.Context, uid keybase1.UID) (
-	[]keybase1.PublicKey, error) {
-	if err := checkContext(ctx); err != nil {
-		return nil, err
-	}
-
-	k.lock.Lock()
-	defer k.lock.Unlock()
-	u, err := k.localUsers.getLocalUser(uid)
-	if err != nil {
-		return nil, err
-	}
-	return u.UnverifiedKeys, nil
-}
-
 // GetCurrentMerkleRoot implements the KeybaseService interface for
 // KeybaseDaemonLocal.
 func (k *KeybaseDaemonLocal) GetCurrentMerkleRoot(ctx context.Context) (
-	keybase1.MerkleRootV2, error) {
+	keybase1.MerkleRootV2, time.Time, error) {
 	if err := checkContext(ctx); err != nil {
-		return keybase1.MerkleRootV2{}, err
+		return keybase1.MerkleRootV2{}, time.Time{}, err
 	}
 
 	k.lock.Lock()
 	defer k.lock.Unlock()
-	return k.merkleRoot, nil
+	return k.merkleRoot, k.merkleTime, nil
+}
+
+// VerifyMerkleRoot implements the KBPKI interface for KeybaseDaemonLocal.
+func (k *KeybaseDaemonLocal) VerifyMerkleRoot(
+	_ context.Context, _ keybase1.MerkleRootV2, _ keybase1.KBFSRoot) error {
+	return nil
+}
+
+func (k *KeybaseDaemonLocal) setCurrentMerkleRoot(
+	root keybase1.MerkleRootV2, rootTime time.Time) {
+	k.lock.Lock()
+	defer k.lock.Unlock()
+	k.merkleRoot = root
+	k.merkleTime = rootTime
 }
 
 // CurrentSession implements KeybaseDaemon for KeybaseDaemonLocal.
@@ -638,6 +639,7 @@ func (k *KeybaseDaemonLocal) addDeviceForTesting(uid keybase1.UID,
 	if err != nil {
 		return 0, fmt.Errorf("No such user %s: %v", uid, err)
 	}
+	user = user.deepCopy()
 
 	index := len(user.VerifyingKeys)
 	newCryptPublicKey, newVerifyingKey := makeKeys(user.Name, index)
@@ -657,6 +659,7 @@ func (k *KeybaseDaemonLocal) revokeDeviceForTesting(clock Clock,
 	if err != nil {
 		return fmt.Errorf("No such user %s: %v", uid, err)
 	}
+	user = user.deepCopy()
 
 	if index >= len(user.VerifyingKeys) ||
 		(k.currentUID == uid && index == user.CurrentCryptPublicKeyIndex) {
@@ -665,19 +668,22 @@ func (k *KeybaseDaemonLocal) revokeDeviceForTesting(clock Clock,
 
 	if user.RevokedVerifyingKeys == nil {
 		user.RevokedVerifyingKeys =
-			make(map[kbfscrypto.VerifyingKey]keybase1.KeybaseTime)
+			make(map[kbfscrypto.VerifyingKey]revokedKeyInfo)
 	}
 	if user.RevokedCryptPublicKeys == nil {
 		user.RevokedCryptPublicKeys =
-			make(map[kbfscrypto.CryptPublicKey]keybase1.KeybaseTime)
+			make(map[kbfscrypto.CryptPublicKey]revokedKeyInfo)
 	}
 
-	kbtime := keybase1.KeybaseTime{
-		Unix:  keybase1.ToTime(clock.Now()),
-		Chain: 100,
+	kbtime := keybase1.ToTime(clock.Now())
+	info := revokedKeyInfo{
+		Time: kbtime,
+		MerkleRoot: keybase1.MerkleRootV2{
+			Seqno: 1,
+		},
 	}
-	user.RevokedVerifyingKeys[user.VerifyingKeys[index]] = kbtime
-	user.RevokedCryptPublicKeys[user.CryptPublicKeys[index]] = kbtime
+	user.RevokedVerifyingKeys[user.VerifyingKeys[index]] = info
+	user.RevokedCryptPublicKeys[user.CryptPublicKeys[index]] = info
 
 	user.VerifyingKeys = append(user.VerifyingKeys[:index],
 		user.VerifyingKeys[index+1:]...)
@@ -732,6 +738,42 @@ func (k *KeybaseDaemonLocal) addTeamWriterForTest(
 	}
 	t.Writers[uid] = true
 	delete(t.Readers, uid)
+	k.localTeams[tid] = t
+	f := keybase1.Folder{
+		Name:       string(t.Name),
+		FolderType: keybase1.FolderType_TEAM,
+	}
+	k.favoriteStore.FavoriteAdd(uid, f)
+	return nil
+}
+
+func (k *KeybaseDaemonLocal) removeTeamWriterForTest(
+	tid keybase1.TeamID, uid keybase1.UID) error {
+	k.lock.Lock()
+	defer k.lock.Unlock()
+	t, err := k.localTeams.getLocalTeam(tid)
+	if err != nil {
+		return err
+	}
+
+	if _, ok := t.Writers[uid]; ok {
+		u, err := k.localUsers.getLocalUser(uid)
+		if err != nil {
+			return err
+		}
+		if t.LastWriters == nil {
+			t.LastWriters = make(
+				map[kbfscrypto.VerifyingKey]keybase1.MerkleRootV2)
+		}
+		for _, key := range u.VerifyingKeys {
+			t.LastWriters[key] = k.merkleRoot
+		}
+	}
+	k.merkleRoot.Seqno++
+
+	delete(t.Writers, uid)
+	delete(t.Readers, uid)
+
 	k.localTeams[tid] = t
 	f := keybase1.Folder{
 		Name:       string(t.Name),
@@ -852,6 +894,12 @@ func (k *KeybaseDaemonLocal) Notify(ctx context.Context, notification *keybase1.
 	return checkContext(ctx)
 }
 
+// NotifyPathUpdated implements KeybaseDaemon for KeybaseDeamonLocal.
+func (k *KeybaseDaemonLocal) NotifyPathUpdated(
+	ctx context.Context, _ string) error {
+	return checkContext(ctx)
+}
+
 // NotifySyncStatus implements KeybaseDaemon for KeybaseDeamonLocal.
 func (k *KeybaseDaemonLocal) NotifySyncStatus(ctx context.Context,
 	_ *keybase1.FSPathSyncStatus) error {
@@ -861,13 +909,6 @@ func (k *KeybaseDaemonLocal) NotifySyncStatus(ctx context.Context,
 // FlushUserFromLocalCache implements the KeybaseDaemon interface for
 // KeybaseDaemonLocal.
 func (k *KeybaseDaemonLocal) FlushUserFromLocalCache(ctx context.Context,
-	uid keybase1.UID) {
-	// Do nothing.
-}
-
-// FlushUserUnverifiedKeysFromLocalCache implements the KeybaseDaemon interface for
-// KeybaseDaemonLocal.
-func (k *KeybaseDaemonLocal) FlushUserUnverifiedKeysFromLocalCache(ctx context.Context,
 	uid keybase1.UID) {
 	// Do nothing.
 }

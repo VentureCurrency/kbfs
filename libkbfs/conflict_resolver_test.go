@@ -30,7 +30,8 @@ func crTestInit(t *testing.T) (ctx context.Context, cancel context.CancelFunc,
 	config.SetClock(wallClock{})
 	id := tlf.FakeID(1, tlf.Private)
 	fbo := newFolderBranchOps(
-		ctx, config, FolderBranch{id, MasterBranch}, standard)
+		ctx, libkb.NewGlobalContext().Init(), config,
+		FolderBranch{id, MasterBranch}, standard)
 	// usernames don't matter for these tests
 	config.mockKbpki.EXPECT().GetNormalizedUsername(gomock.Any(), gomock.Any()).
 		AnyTimes().Return(libkb.NormalizedUsername("mockUser"), nil)
@@ -122,7 +123,7 @@ func TestCRInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Branch id err: %+v", bid)
 	}
-	cr.fbo.bid = bid
+	cr.fbo.unmergedBID = bid
 	cr.fbo.head = crMakeFakeRMD(unmergedHead, bid)
 	cr.fbo.headStatus = headTrusted
 	// serve all the MDs from the cache
@@ -184,7 +185,7 @@ func TestCRInputFracturedRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Branch id err: %+v", bid)
 	}
-	cr.fbo.bid = bid
+	cr.fbo.unmergedBID = bid
 	cr.fbo.head = crMakeFakeRMD(unmergedHead, bid)
 	cr.fbo.headStatus = headTrusted
 	// serve all the MDs from the cache
@@ -999,7 +1000,7 @@ func TestCRMergedChainsRenameCycleSimple(t *testing.T) {
 	mergedPathB := cr1.fbo.nodeCache.PathFromNode(dirB1)
 	mergedPaths[unmergedPathB.tailPointer()] = mergedPathB
 
-	ro, err := newRmOp("dirA", unmergedPathRoot.tailPointer())
+	ro, err := newRmOp("dirA", unmergedPathRoot.tailPointer(), Dir)
 	require.NoError(t, err)
 	err = ro.Dir.setRef(unmergedPathRoot.tailPointer())
 	require.NoError(t, err)

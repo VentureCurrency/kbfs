@@ -11,10 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/keybase/client/go/protocol/keybase1"
+	"github.com/keybase/go-framed-msgpack-rpc/rpc"
 	"github.com/keybase/kbfs/env"
 	"github.com/keybase/kbfs/libgit"
 	"github.com/keybase/kbfs/libkbfs"
 	"github.com/keybase/kbfs/libpages"
+	"github.com/keybase/kbfs/simplefs"
 	"github.com/keybase/kbfs/stderrutils"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -118,6 +121,18 @@ func main() {
 	params.EnableJournal = true
 	params.Debug = true
 	params.LogFileConfig.Path = fKBFSLogFile
+	params.LogFileConfig.MaxKeepFiles = 32
+	// Enable simpleFS in case we need to debug.
+	createSimpleFS := func(
+		libkbfsCtx libkbfs.Context, config libkbfs.Config) (
+		rpc.Protocol, error) {
+		return keybase1.SimpleFSProtocol(
+			simplefs.NewSimpleFS(libkbfsCtx.GetGlobalContext(), config)), nil
+	}
+	params.AdditionalProtocolCreators = []libkbfs.AdditionalProtocolCreator{
+		createSimpleFS,
+	}
+
 	kbfsLog, err := libkbfs.InitLog(params, kbCtx)
 	if err != nil {
 		logger.Panic("libkbfs.InitLog", zap.Error(err))

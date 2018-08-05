@@ -1,4 +1,4 @@
-// Copyright 2015-2016 Keybase Inc. All rights reserved.
+// Copyright 2015-2018 Keybase Inc. All rights reserved.
 // Use of this source code is governed by a BSD
 // license that can be found in the LICENSE file.
 
@@ -38,19 +38,6 @@ const (
 	kbfsLibdokanCurrentSession          = MountFlag(C.kbfsLibdokanCurrentSession)
 	kbfsLibdokanUseFindFilesWithPattern = MountFlag(C.kbfsLibdokanUseFindFilesWithPattern)
 )
-
-// loadDokanDLL can be called to init the system with custom Dokan location,
-// e.g. LoadDokanDLL(`C:\mypath\dokan1.dll`).
-func loadDokanDLL(fullpath string) error {
-	if fullpath == "" {
-		return nil
-	}
-	dw := syscall.Errno(C.kbfsLibdokanLoadLibrary((*C.WCHAR)(stringToUtf16Ptr(fullpath))))
-	if dw != 0 {
-		return dw
-	}
-	return nil
-}
 
 const ntstatusOk = C.NTSTATUS(0)
 
@@ -98,14 +85,26 @@ func kbfsLibdokanCreateFile(
 	if cancel != nil {
 		defer cancel()
 	}
-	fi, isDir, err := fs.CreateFile(ctx, makeFI(fname, pfi), &cd)
+	fi, status, err := fs.CreateFile(ctx, makeFI(fname, pfi), &cd)
 	if isDebug {
-		checkFileDirectoryFile(err, isDir, uint32(CreateOptions))
+		checkFileDirectoryFile(err, status.IsDir(), uint32(CreateOptions))
+		debugf("CreateFile result: %v new-entry: %v raw %v", status.IsDir(), status.IsNew(), status)
+		if err == nil && status&isValid == 0 {
+			debugf("CreateFile invalid status for successful operation!")
+		}
 	}
-	if isDir {
+	if status.IsDir() {
 		pfi.IsDirectory = 1
 	}
+	if err == nil && !status.IsNew() && cd.CreateDisposition.isSignalExisting() {
+		debugf("CreateFile adding ErrObjectNameCollision")
+		err = ErrObjectNameCollision
+	}
 	return fiStore(pfi, fi, err)
+}
+
+func (cd CreateDisposition) isSignalExisting() bool {
+	return cd == FileOpenIf || cd == FileSupersede || cd == FileOverwriteIf
 }
 
 func globalContext() context.Context {
@@ -218,7 +217,7 @@ func kbfsLibdokanGetFileInformation(
 		defer cancel()
 	}
 	st, err := getfi(pfi).GetFileInformation(ctx, makeFI(fname, pfi))
-	debug("->", st, err)
+	debugf("-> %#v, %v", st, err)
 	if st != nil {
 		sbuf.dwFileAttributes = C.DWORD(st.FileAttributes)
 		sbuf.ftCreationTime = packTime(st.Creation)

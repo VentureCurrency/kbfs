@@ -53,6 +53,7 @@ type KeybaseServiceBase struct {
 
 	lastNotificationFilenameLock sync.Mutex
 	lastNotificationFilename     string
+	lastPathUpdated              string
 	lastSyncNotificationPath     string
 }
 
@@ -66,8 +67,13 @@ type keybaseServiceMerkleGetter struct {
 var _ merkleRootGetter = (*keybaseServiceMerkleGetter)(nil)
 
 func (k *keybaseServiceMerkleGetter) GetCurrentMerkleRoot(
-	ctx context.Context) (keybase1.MerkleRootV2, error) {
+	ctx context.Context) (keybase1.MerkleRootV2, time.Time, error) {
 	return k.k.getCurrentMerkleRoot(ctx)
+}
+
+func (k *keybaseServiceMerkleGetter) VerifyMerkleRoot(
+	_ context.Context, _ keybase1.MerkleRootV2, _ keybase1.KBFSRoot) error {
+	panic("constMerkleRootGetter doesn't verify merkle roots")
 }
 
 // NewKeybaseServiceBase makes a new KeybaseService.
@@ -114,35 +120,27 @@ type addCryptPublicKeyFunc func(kbfscrypto.CryptPublicKey)
 // processKey adds the given public key to the appropriate verifying
 // or crypt list (as return values), and also updates the given name
 // map and parent map in place.
-func processKey(publicKey keybase1.PublicKey,
+func processKey(publicKey keybase1.PublicKeyV2NaCl,
 	addVerifyingKey addVerifyingKeyFunc,
 	addCryptPublicKey addCryptPublicKeyFunc,
 	kidNames map[keybase1.KID]string,
 	parents map[keybase1.KID]keybase1.KID) error {
-	if len(publicKey.PGPFingerprint) > 0 {
-		return nil
-	}
 	// Import the KID to validate it.
-	key, err := libkb.ImportKeypairFromKID(publicKey.KID)
+	key, err := libkb.ImportKeypairFromKID(publicKey.Base.Kid)
 	if err != nil {
 		return err
 	}
-	if publicKey.IsSibkey {
+	if publicKey.Base.IsSibkey {
 		addVerifyingKey(kbfscrypto.MakeVerifyingKey(key.GetKID()))
 	} else {
 		addCryptPublicKey(kbfscrypto.MakeCryptPublicKey(key.GetKID()))
 	}
 	if publicKey.DeviceDescription != "" {
-		kidNames[publicKey.KID] = publicKey.DeviceDescription
+		kidNames[publicKey.Base.Kid] = publicKey.DeviceDescription
 	}
 
-	if publicKey.ParentID != "" {
-		parentKID, err := keybase1.KIDFromStringChecked(
-			publicKey.ParentID)
-		if err != nil {
-			return err
-		}
-		parents[publicKey.KID] = parentKID
+	if publicKey.Parent != nil {
+		parents[publicKey.Base.Kid] = *publicKey.Parent
 	}
 	return nil
 }
@@ -161,7 +159,7 @@ func updateKIDNamesFromParents(kidNames map[keybase1.KID]string,
 	}
 }
 
-func filterKeys(keys []keybase1.PublicKey) (
+func filterKeys(keys map[keybase1.KID]keybase1.PublicKeyV2NaCl) (
 	verifyingKeys []kbfscrypto.VerifyingKey,
 	cryptPublicKeys []kbfscrypto.CryptPublicKey,
 	kidNames map[keybase1.KID]string, err error) {
@@ -176,6 +174,10 @@ func filterKeys(keys []keybase1.PublicKey) (
 	}
 
 	for _, publicKey := range keys {
+		if publicKey.Base.Revocation != nil {
+			continue
+		}
+
 		err := processKey(publicKey, addVerifyingKey, addCryptPublicKey,
 			kidNames, parents)
 		if err != nil {
@@ -186,23 +188,49 @@ func filterKeys(keys []keybase1.PublicKey) (
 	return verifyingKeys, cryptPublicKeys, kidNames, nil
 }
 
-func filterRevokedKeys(keys []keybase1.RevokedKey) (
-	map[kbfscrypto.VerifyingKey]keybase1.KeybaseTime,
-	map[kbfscrypto.CryptPublicKey]keybase1.KeybaseTime,
+func (k *KeybaseServiceBase) filterRevokedKeys(
+	ctx context.Context,
+	uid keybase1.UID,
+	keys map[keybase1.KID]keybase1.PublicKeyV2NaCl,
+	reset *keybase1.ResetSummary) (
+	map[kbfscrypto.VerifyingKey]revokedKeyInfo,
+	map[kbfscrypto.CryptPublicKey]revokedKeyInfo,
 	map[keybase1.KID]string, error) {
-	verifyingKeys := make(map[kbfscrypto.VerifyingKey]keybase1.KeybaseTime)
-	cryptPublicKeys := make(map[kbfscrypto.CryptPublicKey]keybase1.KeybaseTime)
+	verifyingKeys := make(map[kbfscrypto.VerifyingKey]revokedKeyInfo)
+	cryptPublicKeys := make(map[kbfscrypto.CryptPublicKey]revokedKeyInfo)
 	var kidNames = map[keybase1.KID]string{}
 	var parents = map[keybase1.KID]keybase1.KID{}
 
-	for _, revokedKey := range keys {
+	for _, key := range keys {
+		var info revokedKeyInfo
+		if key.Base.Revocation != nil {
+			info.Time = key.Base.Revocation.Time
+			info.MerkleRoot = key.Base.Revocation.PrevMerkleRootSigned
+			// If we don't have a prev seqno, then we already have the
+			// best merkle data we're going to get.
+			info.filledInMerkle = info.MerkleRoot.Seqno <= 0
+			info.sigChainLocation = key.Base.Revocation.SigChainLocation
+		} else if reset != nil {
+			info.Time = keybase1.ToTime(keybase1.FromUnixTime(reset.Ctime))
+			info.MerkleRoot.Seqno = reset.MerkleRoot.Seqno
+			info.MerkleRoot.HashMeta = reset.MerkleRoot.HashMeta
+			// If we don't have a prev seqno, then we already have the
+			// best merkle data we're going to get.
+			info.filledInMerkle = info.MerkleRoot.Seqno <= 0
+			info.resetSeqno = reset.ResetSeqno
+			info.isReset = true
+		} else {
+			// Not revoked.
+			continue
+		}
+
 		addVerifyingKey := func(key kbfscrypto.VerifyingKey) {
-			verifyingKeys[key] = revokedKey.Time
+			verifyingKeys[key] = info
 		}
 		addCryptPublicKey := func(key kbfscrypto.CryptPublicKey) {
-			cryptPublicKeys[key] = revokedKey.Time
+			cryptPublicKeys[key] = info
 		}
-		err := processKey(revokedKey.Key, addVerifyingKey, addCryptPublicKey,
+		err := processKey(key, addVerifyingKey, addCryptPublicKey,
 			kidNames, parents)
 		if err != nil {
 			return nil, nil, nil, err
@@ -348,6 +376,12 @@ func (k *KeybaseServiceBase) KeyfamilyChanged(ctx context.Context,
 func (k *KeybaseServiceBase) ReachabilityChanged(ctx context.Context,
 	reachability keybase1.Reachability) error {
 	k.log.CDebugf(ctx, "CheckReachability invoked: %v", reachability)
+	if reachability.Reachable == keybase1.Reachable_YES {
+		k.config.KBFSOps().PushConnectionStatusChange(GregorServiceName, nil)
+	} else {
+		k.config.KBFSOps().PushConnectionStatusChange(
+			GregorServiceName, errDisconnected{})
+	}
 	mdServer := k.config.MDServer()
 	if mdServer != nil {
 		mdServer.CheckReachability(ctx)
@@ -443,15 +477,19 @@ func (k *KeybaseServiceBase) Identify(ctx context.Context, assertion, reason str
 	arg.IdentifyBehavior = ei.behavior
 
 	res, err := k.identifyClient.IdentifyLite(ctx, arg)
-	// Identify2 still returns keybase1.UserPlusKeys data (sans keys),
-	// even if it gives a NoSigChainError, and in KBFS it's fine if
-	// the user doesn't have a full sigchain yet (e.g., it's just like
-	// the sharing before signup case, except the user already has a
-	// UID).
-	if _, ok := err.(libkb.NoSigChainError); ok {
-		k.log.CDebugf(ctx, "Ignoring error (%s) for user %s with no sigchain",
-			err, res.Ul.Name)
-	} else if err != nil {
+	// IdentifyLite still returns keybase1.UserPlusKeys data (sans
+	// keys), even if it gives a NoSigChainError or a UserDeletedError,
+	// and in KBFS it's fine if the user doesn't have a full sigchain
+	// (e.g., it's just like the sharing before signup case, except
+	// the user already has a UID).  Both types of users are based
+	// entirely on server trust anyway.
+	switch err.(type) {
+	case nil:
+	case libkb.NoSigChainError, libkb.UserDeletedError:
+		k.log.CDebugf(ctx,
+			"Ignoring error (%s) for user %s with no sigchain; "+
+				"error type=%T", err, res.Ul.Name, err)
+	default:
 		return libkb.NormalizedUsername(""), keybase1.UserOrTeamID(""),
 			ConvertIdentifyError(assertion, err)
 	}
@@ -537,6 +575,63 @@ func (k *KeybaseServiceBase) ResolveImplicitTeamByID(
 	return res.Name, nil
 }
 
+func (k *KeybaseServiceBase) checkForRevokedVerifyingKey(
+	ctx context.Context, currUserInfo UserInfo, kid keybase1.KID) (
+	newUserInfo UserInfo, exists bool, err error) {
+	for key, info := range currUserInfo.RevokedVerifyingKeys {
+		if !key.KID().Equal(kid) {
+			continue
+		}
+		exists = true
+		if info.filledInMerkle {
+			break
+		}
+
+		k.log.CDebugf(ctx, "Filling in merkle info for user %s, revoked key %s",
+			currUserInfo.UID, kid)
+
+		// If possible, ask the service to give us the first merkle
+		// root that covers this revoke. Some older device revokes
+		// didn't yet include a prev field, so we can't refine the
+		// merkle root in those cases, and will be relying only on
+		// server trust.
+		if info.MerkleRoot.Seqno > 0 {
+			var res keybase1.NextMerkleRootRes
+			if info.isReset {
+				res, err = k.userClient.FindNextMerkleRootAfterReset(ctx,
+					keybase1.FindNextMerkleRootAfterResetArg{
+						Uid:        currUserInfo.UID,
+						ResetSeqno: info.resetSeqno,
+						Prev: keybase1.ResetMerkleRoot{
+							Seqno:    info.MerkleRoot.Seqno,
+							HashMeta: info.MerkleRoot.HashMeta,
+						},
+					})
+			} else {
+				res, err = k.userClient.FindNextMerkleRootAfterRevoke(ctx,
+					keybase1.FindNextMerkleRootAfterRevokeArg{
+						Uid:  currUserInfo.UID,
+						Kid:  kid,
+						Loc:  info.sigChainLocation,
+						Prev: info.MerkleRoot,
+					})
+			}
+			if err != nil {
+				return UserInfo{}, false, err
+			}
+			if res.Res != nil {
+				info.MerkleRoot = *res.Res
+			}
+		}
+		info.filledInMerkle = true
+		currUserInfo.RevokedVerifyingKeys[key] = info
+		k.setCachedUserInfo(currUserInfo.UID, currUserInfo)
+		break
+	}
+
+	return currUserInfo, exists, nil
+}
+
 // LoadUserPlusKeys implements the KeybaseService interface for
 // KeybaseServiceBase.
 func (k *KeybaseServiceBase) LoadUserPlusKeys(ctx context.Context,
@@ -546,21 +641,78 @@ func (k *KeybaseServiceBase) LoadUserPlusKeys(ctx context.Context,
 		if pollForKID == keybase1.KID("") {
 			return cachedUserInfo, nil
 		}
-		// Skip the cache if pollForKID isn't present in `VerifyingKeys`.
+		// Skip the cache if pollForKID isn't present in
+		// `VerifyingKeys` or one of the revoked verifying keys.
 		for _, key := range cachedUserInfo.VerifyingKeys {
 			if key.KID().Equal(pollForKID) {
 				return cachedUserInfo, nil
 			}
 		}
+
+		// Check if the key is revoked, and fill in the merkle info in
+		// that case.
+		cachedUserInfo, exists, err := k.checkForRevokedVerifyingKey(
+			ctx, cachedUserInfo, pollForKID)
+		if err != nil {
+			return UserInfo{}, err
+		}
+		if exists {
+			return cachedUserInfo, nil
+		}
 	}
 
-	arg := keybase1.LoadUserPlusKeysArg{Uid: uid, PollForKID: pollForKID}
-	res, err := k.userClient.LoadUserPlusKeys(ctx, arg)
+	arg := keybase1.LoadUserPlusKeysV2Arg{Uid: uid, PollForKID: pollForKID}
+	res, err := k.userClient.LoadUserPlusKeysV2(ctx, arg)
 	if err != nil {
 		return UserInfo{}, err
 	}
 
-	return k.processUserPlusKeys(res)
+	userInfo, err := k.processUserPlusKeys(ctx, res)
+	if err != nil {
+		return UserInfo{}, err
+	}
+
+	if pollForKID != keybase1.KID("") {
+		// Fill in merkle info if we were explicitly trying to load a
+		// revoked key.
+		userInfo, _, err = k.checkForRevokedVerifyingKey(
+			ctx, userInfo, pollForKID)
+		if err != nil {
+			return UserInfo{}, err
+		}
+	}
+	return userInfo, nil
+}
+
+func (k *KeybaseServiceBase) getLastWriterInfo(
+	ctx context.Context, teamInfo TeamInfo, tlfType tlf.Type, user keybase1.UID,
+	verifyingKey kbfscrypto.VerifyingKey) (TeamInfo, error) {
+	if _, ok := teamInfo.LastWriters[verifyingKey]; ok {
+		// Already cached, nothing to do.
+		return teamInfo, nil
+	}
+
+	res, err := k.teamsClient.FindNextMerkleRootAfterTeamRemovalBySigningKey(
+		ctx, keybase1.FindNextMerkleRootAfterTeamRemovalBySigningKeyArg{
+			Uid:        user,
+			SigningKey: verifyingKey.KID(),
+			Team:       teamInfo.TID,
+			IsPublic:   tlfType == tlf.Public,
+		})
+	if err != nil {
+		return TeamInfo{}, err
+	}
+
+	// Copy any old data to avoid races.
+	newLastWriters := make(
+		map[kbfscrypto.VerifyingKey]keybase1.MerkleRootV2,
+		len(teamInfo.LastWriters)+1)
+	for k, v := range teamInfo.LastWriters {
+		newLastWriters[k] = v
+	}
+	newLastWriters[verifyingKey] = *res.Res
+	teamInfo.LastWriters = newLastWriters
+	return teamInfo, nil
 }
 
 var allowedLoadTeamRoles = map[keybase1.TeamRole]bool{
@@ -572,8 +724,9 @@ var allowedLoadTeamRoles = map[keybase1.TeamRole]bool{
 // LoadTeamPlusKeys implements the KeybaseService interface for
 // KeybaseServiceBase.
 func (k *KeybaseServiceBase) LoadTeamPlusKeys(
-	ctx context.Context, tid keybase1.TeamID, desiredKeyGen kbfsmd.KeyGen,
-	desiredUser keybase1.UserVersion, desiredRole keybase1.TeamRole) (
+	ctx context.Context, tid keybase1.TeamID, tlfType tlf.Type,
+	desiredKeyGen kbfsmd.KeyGen, desiredUser keybase1.UserVersion,
+	desiredKey kbfscrypto.VerifyingKey, desiredRole keybase1.TeamRole) (
 	TeamInfo, error) {
 	if !allowedLoadTeamRoles[desiredRole] {
 		panic(fmt.Sprintf("Disallowed team role: %v", desiredRole))
@@ -595,12 +748,26 @@ func (k *KeybaseServiceBase) LoadTeamPlusKeys(
 			// If the user is in the writer map, that satisfies none, reader
 			// or writer desires.
 			satisfiesDesires = cachedTeamInfo.Writers[desiredUser.Uid]
-			// If not, and the desire role is a reader, we need to
-			// check the reader map explicitly.
-			if !satisfiesDesires &&
-				(desiredRole == keybase1.TeamRole_NONE ||
-					desiredRole == keybase1.TeamRole_READER) {
-				satisfiesDesires = cachedTeamInfo.Readers[desiredUser.Uid]
+			if !satisfiesDesires {
+				if desiredRole == keybase1.TeamRole_NONE ||
+					desiredRole == keybase1.TeamRole_READER {
+					// If the user isn't a writer, but the desired
+					// role is a reader, we need to check the reader
+					// map explicitly.
+					satisfiesDesires = cachedTeamInfo.Readers[desiredUser.Uid]
+				} else if !desiredKey.IsNil() {
+					// If the desired role was at least a writer, but
+					// the user isn't currently a writer, see if they
+					// ever were.
+					var err error
+					cachedTeamInfo, err = k.getLastWriterInfo(
+						ctx, cachedTeamInfo, tlfType, desiredUser.Uid,
+						desiredKey)
+					if err != nil {
+						return TeamInfo{}, err
+					}
+					k.setCachedTeamInfo(tid, cachedTeamInfo)
+				}
 			}
 		}
 
@@ -619,7 +786,7 @@ func (k *KeybaseServiceBase) LoadTeamPlusKeys(
 			keybase1.PerTeamKeyGeneration(desiredKeyGen)
 	}
 
-	if desiredUser.Uid.Exists() {
+	if desiredUser.Uid.Exists() && desiredKey.IsNil() {
 		arg.Refreshers.WantMembers = append(
 			arg.Refreshers.WantMembers, desiredUser)
 		arg.Refreshers.WantMembersRole = desiredRole
@@ -667,7 +834,18 @@ func (k *KeybaseServiceBase) LoadTeamPlusKeys(
 		info.RootID = rootID
 	}
 
+	// Fill in `LastWriters`, only if needed.
+	if desiredUser.Uid.Exists() && desiredRole == keybase1.TeamRole_WRITER &&
+		!info.Writers[desiredUser.Uid] && !desiredKey.IsNil() {
+		info, err = k.getLastWriterInfo(
+			ctx, info, tlfType, desiredUser.Uid, desiredKey)
+		if err != nil {
+			return TeamInfo{}, err
+		}
+	}
+
 	k.setCachedTeamInfo(tid, info)
+
 	return info, nil
 }
 
@@ -691,36 +869,51 @@ func (k *KeybaseServiceBase) GetTeamSettings(
 }
 
 func (k *KeybaseServiceBase) getCurrentMerkleRoot(ctx context.Context) (
-	keybase1.MerkleRootV2, error) {
+	keybase1.MerkleRootV2, time.Time, error) {
 	const merkleFreshnessMs = int(time.Second * 60 / time.Millisecond)
 	res, err := k.merkleClient.GetCurrentMerkleRoot(ctx, merkleFreshnessMs)
 	if err != nil {
-		return keybase1.MerkleRootV2{}, err
+		return keybase1.MerkleRootV2{}, time.Time{}, err
 	}
 
-	return res.Root, nil
+	return res.Root, keybase1.FromTime(res.UpdateTime), nil
 }
 
 // GetCurrentMerkleRoot implements the KeybaseService interface for
 // KeybaseServiceBase.
 func (k *KeybaseServiceBase) GetCurrentMerkleRoot(ctx context.Context) (
-	keybase1.MerkleRootV2, error) {
+	keybase1.MerkleRootV2, time.Time, error) {
 	// Refresh the cached value in the background if the cached value
 	// is older than 30s; if our cached value is more than 60s old,
 	// block.
-	_, root, err := k.merkleRoot.Get(ctx, 30*time.Second, 60*time.Second)
-	return root, err
+	_, root, rootTime, err := k.merkleRoot.Get(
+		ctx, 30*time.Second, 60*time.Second)
+	return root, rootTime, err
 }
 
-func (k *KeybaseServiceBase) processUserPlusKeys(upk keybase1.UserPlusKeys) (
+// VerifyMerkleRoot implements the KBPKI interface for KeybaseServiceBase.
+func (k *KeybaseServiceBase) VerifyMerkleRoot(
+	ctx context.Context, root keybase1.MerkleRootV2,
+	kbfsRoot keybase1.KBFSRoot) error {
+	return k.merkleClient.VerifyMerkleRootAndKBFS(ctx,
+		keybase1.VerifyMerkleRootAndKBFSArg{
+			Root:             root,
+			ExpectedKBFSRoot: kbfsRoot,
+		})
+}
+
+func (k *KeybaseServiceBase) processUserPlusKeys(
+	ctx context.Context, upk keybase1.UserPlusKeysV2AllIncarnations) (
 	UserInfo, error) {
-	verifyingKeys, cryptPublicKeys, kidNames, err := filterKeys(upk.DeviceKeys)
+	verifyingKeys, cryptPublicKeys, kidNames, err := filterKeys(
+		upk.Current.DeviceKeys)
 	if err != nil {
 		return UserInfo{}, err
 	}
 
 	revokedVerifyingKeys, revokedCryptPublicKeys, revokedKidNames, err :=
-		filterRevokedKeys(upk.RevokedDeviceKeys)
+		k.filterRevokedKeys(
+			ctx, upk.Current.Uid, upk.Current.DeviceKeys, upk.Current.Reset)
 	if err != nil {
 		return UserInfo{}, err
 	}
@@ -731,36 +924,43 @@ func (k *KeybaseServiceBase) processUserPlusKeys(upk keybase1.UserPlusKeys) (
 		}
 	}
 
+	for _, incarnation := range upk.PastIncarnations {
+		revokedVerifyingKeysPast, revokedCryptPublicKeysPast,
+			revokedKidNames, err :=
+			k.filterRevokedKeys(
+				ctx, incarnation.Uid, incarnation.DeviceKeys, incarnation.Reset)
+		if err != nil {
+			return UserInfo{}, err
+		}
+
+		if len(revokedKidNames) > 0 {
+			for k, v := range revokedKidNames {
+				kidNames[k] = v
+			}
+		}
+
+		for k, v := range revokedVerifyingKeysPast {
+			revokedVerifyingKeys[k] = v
+		}
+		for k, v := range revokedCryptPublicKeysPast {
+			revokedCryptPublicKeys[k] = v
+		}
+	}
+
 	u := UserInfo{
-		Name:                   libkb.NewNormalizedUsername(upk.Username),
-		UID:                    upk.Uid,
+		Name: libkb.NewNormalizedUsername(
+			upk.Current.Username),
+		UID:                    upk.Current.Uid,
 		VerifyingKeys:          verifyingKeys,
 		CryptPublicKeys:        cryptPublicKeys,
 		KIDNames:               kidNames,
-		EldestSeqno:            upk.EldestSeqno,
+		EldestSeqno:            upk.Current.EldestSeqno,
 		RevokedVerifyingKeys:   revokedVerifyingKeys,
 		RevokedCryptPublicKeys: revokedCryptPublicKeys,
 	}
 
-	k.setCachedUserInfo(upk.Uid, u)
+	k.setCachedUserInfo(upk.Current.Uid, u)
 	return u, nil
-}
-
-// LoadUnverifiedKeys implements the KeybaseService interface for KeybaseServiceBase.
-func (k *KeybaseServiceBase) LoadUnverifiedKeys(ctx context.Context, uid keybase1.UID) (
-	[]keybase1.PublicKey, error) {
-	if keys, ok := k.getCachedUnverifiedKeys(uid); ok {
-		return keys, nil
-	}
-
-	arg := keybase1.LoadAllPublicKeysUnverifiedArg{Uid: uid}
-	keys, err := k.userClient.LoadAllPublicKeysUnverified(ctx, arg)
-	if err != nil {
-		return nil, err
-	}
-
-	k.setCachedUnverifiedKeys(uid, keys)
-	return keys, nil
 }
 
 func (k *KeybaseServiceBase) getCachedCurrentSessionOrInProgressCh() (
@@ -847,7 +1047,7 @@ func (k *KeybaseServiceBase) CurrentSession(ctx context.Context, sessionID int) 
 
 	if newSession && k.config != nil {
 		// Don't hold the lock while calling `serviceLoggedIn`.
-		serviceLoggedIn(ctx, k.config, s, TLFJournalBackgroundWorkEnabled)
+		_ = serviceLoggedIn(ctx, k.config, s, TLFJournalBackgroundWorkEnabled)
 	}
 
 	return s, nil
@@ -890,6 +1090,25 @@ func (k *KeybaseServiceBase) Notify(ctx context.Context, notification *keybase1.
 	return k.kbfsClient.FSEvent(ctx, *notification)
 }
 
+// NotifyPathUpdated implements the KeybaseService interface for
+// KeybaseServiceBase.
+func (k *KeybaseServiceBase) NotifyPathUpdated(
+	ctx context.Context, path string) error {
+	// Reduce log spam by not repeating log lines for
+	// notifications with the same filename.
+	//
+	// TODO: Only do this in debug mode.
+	func() {
+		k.lastNotificationFilenameLock.Lock()
+		defer k.lastNotificationFilenameLock.Unlock()
+		if path != k.lastPathUpdated {
+			k.lastPathUpdated = path
+			k.log.CDebugf(ctx, "Sending path updated notification for %s", path)
+		}
+	}()
+	return k.kbfsClient.FSPathUpdate(ctx, path)
+}
+
 // NotifySyncStatus implements the KeybaseService interface for
 // KeybaseServiceBase.
 func (k *KeybaseServiceBase) NotifySyncStatus(ctx context.Context,
@@ -915,14 +1134,6 @@ func (k *KeybaseServiceBase) FlushUserFromLocalCache(ctx context.Context,
 	uid keybase1.UID) {
 	k.log.CDebugf(ctx, "Flushing cache for user %s", uid)
 	k.setCachedUserInfo(uid, UserInfo{})
-}
-
-// FlushUserUnverifiedKeysFromLocalCache implements the KeybaseService interface for
-// KeybaseServiceBase.
-func (k *KeybaseServiceBase) FlushUserUnverifiedKeysFromLocalCache(ctx context.Context,
-	uid keybase1.UID) {
-	k.log.CDebugf(ctx, "Flushing cache of unverified keys for user %s", uid)
-	k.clearCachedUnverifiedKeys(uid)
 }
 
 // CtxKeybaseServiceTagKey is the type used for unique context tags
@@ -959,41 +1170,20 @@ func (k *KeybaseServiceBase) FSEditListRequest(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	editHistory, err := k.config.KBFSOps().GetEditHistory(ctx,
+	history, err := k.config.KBFSOps().GetEditHistory(ctx,
 		rootNode.GetFolderBranch())
 	if err != nil {
 		return err
 	}
 
-	// Convert the edits to an RPC response.
-	var resp keybase1.FSEditListArg
-	for writer, edits := range editHistory {
-		for _, edit := range edits {
-			var nType keybase1.FSNotificationType
-			switch edit.Type {
-			case FileCreated:
-				nType = keybase1.FSNotificationType_FILE_CREATED
-			case FileModified:
-				nType = keybase1.FSNotificationType_FILE_MODIFIED
-			default:
-				k.log.CDebugf(ctx, "Bad notification type in edit history: %v",
-					edit.Type)
-				continue
-			}
-			n := keybase1.FSNotification{
-				Filename:         edit.Filepath,
-				StatusCode:       keybase1.FSStatusCode_FINISH,
-				NotificationType: nType,
-				WriterUid:        writer,
-				LocalTime:        keybase1.ToTime(edit.LocalTime),
-			}
-			resp.Edits = append(resp.Edits, n)
-		}
+	// TODO(KBFS-2996) Convert the edits to an RPC response.
+	resp := keybase1.FSEditListArg{
+		RequestID: req.RequestID,
+		Edits:     history,
 	}
-	resp.RequestID = req.RequestID
 
-	k.log.CDebugf(ctx, "Sending edit history response with %d edits",
-		len(resp.Edits))
+	k.log.CDebugf(ctx, "Sending edit history response with %d writer clusters",
+		len(resp.Edits.History))
 	return k.kbfsClient.FSEditList(ctx, resp)
 }
 
@@ -1050,6 +1240,26 @@ func (k *KeybaseServiceBase) TeamDeleted(ctx context.Context,
 	return nil
 }
 
+// TeamExit implements keybase1.NotifyTeamInterface for KeybaseServiceBase.
+func (k *KeybaseDaemonRPC) TeamExit(context.Context, keybase1.TeamID) error {
+	return nil
+}
+
+// TeamAbandoned implements keybase1.NotifyTeamInterface for KeybaseServiceBase.
+func (k *KeybaseDaemonRPC) TeamAbandoned(
+	ctx context.Context, tid keybase1.TeamID) error {
+	k.log.CDebugf(ctx, "Implicit team %s abandoned", tid)
+	k.setCachedTeamInfo(tid, TeamInfo{})
+	k.config.KBFSOps().TeamAbandoned(ctx, tid)
+	return nil
+}
+
+// AvatarUpdated implements keybase1.NotifyTeamInterface for KeybaseServiceBase.
+func (k *KeybaseDaemonRPC) AvatarUpdated(ctx context.Context,
+	arg keybase1.AvatarUpdatedArg) error {
+	return nil
+}
+
 // StartMigration implements keybase1.ImplicitTeamMigrationInterface for
 // KeybaseServiceBase.
 func (k *KeybaseServiceBase) StartMigration(ctx context.Context,
@@ -1066,6 +1276,19 @@ func (k *KeybaseServiceBase) StartMigration(ctx context.Context,
 		return err
 	}
 	return k.config.MDServer().StartImplicitTeamMigration(ctx, handle.TlfID())
+}
+
+// FinalizeMigration implements keybase1.ImplicitTeamMigrationInterface for
+// KeybaseServiceBase.
+func (k *KeybaseServiceBase) FinalizeMigration(ctx context.Context,
+	folder keybase1.Folder) (err error) {
+	fav := NewFavoriteFromFolder(folder)
+	handle, err := GetHandleFromFolderNameAndType(
+		ctx, k.config.KBPKI(), k.config.MDOps(), fav.Name, fav.Type)
+	if err != nil {
+		return err
+	}
+	return k.config.KBFSOps().MigrateToImplicitTeam(ctx, handle.TlfID())
 }
 
 // GetTLFCryptKeys implements the TlfKeysInterface interface for

@@ -6,6 +6,7 @@ package libkbfs
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/protocol/keybase1"
@@ -1158,4 +1159,48 @@ func (e DiskBlockCacheError) ToStatus() (s keybase1.Status) {
 // Error implements the Error interface for DiskBlockCacheError.
 func (e DiskBlockCacheError) Error() string {
 	return "DiskBlockCacheError{" + e.Msg + "}"
+}
+
+// RevokedDeviceVerificationError indicates that the user is trying to
+// verify a key that has been revoked.  It includes useful information
+// about the revocation, so the code receiving the error can check if
+// the device was valid at the time of the data being checked.
+type RevokedDeviceVerificationError struct {
+	info revokedKeyInfo
+}
+
+// Error implements the Error interface for RevokedDeviceVerificationError.
+func (e RevokedDeviceVerificationError) Error() string {
+	return fmt.Sprintf("Device was revoked at time %s, root seqno %d",
+		e.info.Time.Time().Format(time.RFC3339Nano), e.info.MerkleRoot.Seqno)
+}
+
+// MDWrittenAfterRevokeError indicates that we failed to verify an MD
+// revision because it was written after the last valid revision that
+// the corresponding device could have written.
+type MDWrittenAfterRevokeError struct {
+	tlfID        tlf.ID
+	revBad       kbfsmd.Revision
+	revLimit     kbfsmd.Revision
+	verifyingKey kbfscrypto.VerifyingKey
+}
+
+// Error implements the Error interface for MDWrittenAfterRevokeError.
+func (e MDWrittenAfterRevokeError) Error() string {
+	return fmt.Sprintf("Failed to verify revision %d of folder %s by key %s; "+
+		"last valid revision would have been %d",
+		e.revBad, e.tlfID, e.verifyingKey, e.revLimit)
+}
+
+// RevGarbageCollectedError indicates that the user is trying to
+// access a revision that's already been garbage-collected.
+type RevGarbageCollectedError struct {
+	rev       kbfsmd.Revision
+	lastGCRev kbfsmd.Revision
+}
+
+// Error implements the Error interface for RevGarbageCollectedError.
+func (e RevGarbageCollectedError) Error() string {
+	return fmt.Sprintf("Requested revision %d has already been garbage "+
+		"collected (last GC'd rev=%d)", e.rev, e.lastGCRev)
 }

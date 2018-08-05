@@ -160,7 +160,7 @@ func GetHandleFromFolderNameAndType(
 	t tlf.Type) (*TlfHandle, error) {
 	for {
 		tlfHandle, err := ParseTlfHandle(ctx, kbpki, idGetter, tlfName, t)
-		switch e := err.(type) {
+		switch e := errors.Cause(err).(type) {
 		case TlfNameNotCanonical:
 			tlfName = e.NameToTry
 		case nil:
@@ -201,4 +201,34 @@ func isWriterFromHandle(
 		return false, err
 	}
 	return checker.IsTeamWriter(ctx, tid, uid, verifyingKey)
+}
+
+func isReaderFromHandle(
+	ctx context.Context, h *TlfHandle, checker kbfsmd.TeamMembershipChecker,
+	uid keybase1.UID) (bool, error) {
+	if h.TypeForKeying() != tlf.TeamKeying {
+		return h.IsReader(uid), nil
+	}
+
+	// Team membership needs to be checked with the service.  For a
+	// SingleTeam TLF, there is always only a single writer in the
+	// handle.
+	tid, err := h.FirstResolvedWriter().AsTeam()
+	if err != nil {
+		return false, err
+	}
+	return checker.IsTeamReader(ctx, tid, uid)
+}
+
+func tlfToMerkleTreeID(id tlf.ID) keybase1.MerkleTreeID {
+	switch id.Type() {
+	case tlf.Private:
+		return keybase1.MerkleTreeID_KBFS_PRIVATE
+	case tlf.Public:
+		return keybase1.MerkleTreeID_KBFS_PUBLIC
+	case tlf.SingleTeam:
+		return keybase1.MerkleTreeID_KBFS_PRIVATETEAM
+	default:
+		panic(fmt.Sprintf("Unexpected TLF type: %d", id.Type()))
+	}
 }

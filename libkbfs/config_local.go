@@ -6,7 +6,6 @@ package libkbfs
 
 import (
 	"flag"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +19,7 @@ import (
 	"github.com/keybase/kbfs/ioutil"
 	"github.com/keybase/kbfs/kbfscodec"
 	"github.com/keybase/kbfs/kbfscrypto"
+	"github.com/keybase/kbfs/kbfsedits"
 	"github.com/keybase/kbfs/kbfsmd"
 	"github.com/keybase/kbfs/tlf"
 	"github.com/pkg/errors"
@@ -34,23 +34,18 @@ import (
 const (
 	// Max supported size of a directory entry name.
 	maxNameBytesDefault = 255
-	// Maximum supported plaintext size of a directory in KBFS. TODO:
-	// increase this once we support levels of indirection for
-	// directories.
-	maxDirBytesDefault = MaxBlockSizeBytesDefault
+	// Maximum supported plaintext size of a directory in KBFS.  Make
+	// it bigger than the default block size because we added the
+	// revision skiplist to the directory entries and we didn't want
+	// to break legacy directories in the case that all of their
+	// entries got updated EntryInfos.  TODO: increase this once we
+	// support levels of indirection for directories.
+	maxDirBytesDefault = MaxBlockSizeBytesDefault * 1.5
 	// Default time after setting the rekey bit before prompting for a
 	// paper key.
 	rekeyWithPromptWaitTimeDefault = 10 * time.Minute
 	// see Config doc for the purpose of DelayedCancellationGracePeriod
 	delayedCancellationGracePeriodDefault = 2 * time.Second
-	// How often do we check for stuff to reclaim?
-	qrPeriodDefault = 1 * time.Minute
-	// How long must something be unreferenced before we reclaim it?
-	qrUnrefAgeDefault = 1 * time.Minute
-	// How old must the most recent TLF revision be before another
-	// device can run QR on that TLF?  This is large, to avoid
-	// unnecessary conflicts on the TLF between devices.
-	qrMinHeadAgeDefault = 24 * time.Hour
 	// tlfValidDurationDefault is the default for tlf validity before redoing identify.
 	tlfValidDurationDefault = 6 * time.Hour
 	// bgFlushDirOpThresholdDefault is the default for how many
@@ -85,6 +80,7 @@ type ConfigLocal struct {
 	mdops            MDOps
 	kops             KeyOps
 	crypto           Crypto
+	chat             Chat
 	mdcache          MDCache
 	bops             BlockOps
 	mdserv           MDServer
@@ -96,6 +92,7 @@ type ConfigLocal struct {
 	clock            Clock
 	kbpki            KBPKI
 	renamer          ConflictRenamer
+	userHistory      *kbfsedits.UserHistory
 	registry         metrics.Registry
 	loggerFn         func(prefix string) logger.Logger
 	noBGFlush        bool // logic opposite so the default value is the common setting
@@ -116,9 +113,6 @@ type ConfigLocal struct {
 	traceLock    sync.RWMutex
 	traceEnabled bool
 
-	qrPeriod                       time.Duration
-	qrUnrefAge                     time.Duration
-	qrMinHeadAge                   time.Duration
 	delayedCancellationGracePeriod time.Duration
 
 	// allKnownConfigsForTesting is used for testing, and contains all created
@@ -239,6 +233,44 @@ func (lu *LocalUser) GetPublicKeys() []keybase1.PublicKey {
 	sibkeys := verifyingKeysToPublicKeys(lu.VerifyingKeys)
 	subkeys := cryptPublicKeysToPublicKeys(lu.CryptPublicKeys)
 	return append(sibkeys, subkeys...)
+}
+
+func (lu LocalUser) deepCopy() LocalUser {
+	luCopy := lu
+
+	luCopy.VerifyingKeys = make(
+		[]kbfscrypto.VerifyingKey, len(lu.VerifyingKeys))
+	copy(luCopy.VerifyingKeys, lu.VerifyingKeys)
+
+	luCopy.CryptPublicKeys = make(
+		[]kbfscrypto.CryptPublicKey, len(lu.CryptPublicKeys))
+	copy(luCopy.CryptPublicKeys, lu.CryptPublicKeys)
+
+	luCopy.KIDNames = make(map[keybase1.KID]string, len(lu.KIDNames))
+	for k, v := range lu.KIDNames {
+		luCopy.KIDNames[k] = v
+	}
+
+	luCopy.RevokedVerifyingKeys = make(
+		map[kbfscrypto.VerifyingKey]revokedKeyInfo,
+		len(lu.RevokedVerifyingKeys))
+	for k, v := range lu.RevokedVerifyingKeys {
+		luCopy.RevokedVerifyingKeys[k] = v
+	}
+
+	luCopy.RevokedCryptPublicKeys = make(
+		map[kbfscrypto.CryptPublicKey]revokedKeyInfo,
+		len(lu.RevokedCryptPublicKeys))
+	for k, v := range lu.RevokedCryptPublicKeys {
+		luCopy.RevokedCryptPublicKeys[k] = v
+	}
+
+	luCopy.Asserts = make([]string, len(lu.Asserts))
+	copy(luCopy.Asserts, lu.Asserts)
+	luCopy.UnverifiedKeys = make([]keybase1.PublicKey, len(lu.UnverifiedKeys))
+	copy(luCopy.UnverifiedKeys, lu.UnverifiedKeys)
+
+	return luCopy
 }
 
 // Helper functions to get a various keys for a local user suitable
@@ -370,8 +402,10 @@ func getDefaultCleanBlockCacheCapacity() uint64 {
 //
 // TODO: Now that NewConfigLocal takes loggerFn, add more default
 // components.
-func NewConfigLocal(mode InitMode, loggerFn func(module string) logger.Logger,
-	storageRoot string, diskCacheMode DiskCacheMode, kbCtx Context) *ConfigLocal {
+func NewConfigLocal(mode InitMode,
+	loggerFn func(module string) logger.Logger,
+	storageRoot string, diskCacheMode DiskCacheMode,
+	kbCtx Context) *ConfigLocal {
 	config := &ConfigLocal{
 		loggerFn:      loggerFn,
 		storageRoot:   storageRoot,
@@ -389,19 +423,16 @@ func NewConfigLocal(mode InitMode, loggerFn func(module string) logger.Logger,
 	config.SetCodec(kbfscodec.NewMsgpack())
 	config.SetKeyOps(&KeyOpsStandard{config})
 	config.SetRekeyQueue(NewRekeyQueueStandard(config))
+	config.SetUserHistory(kbfsedits.NewUserHistory())
 
 	config.maxNameBytes = maxNameBytesDefault
 	config.maxDirBytes = maxDirBytesDefault
 	config.rwpWaitTime = rekeyWithPromptWaitTimeDefault
 
 	config.delayedCancellationGracePeriod = delayedCancellationGracePeriodDefault
-	config.qrPeriod = qrPeriodDefault
-	config.qrUnrefAge = qrUnrefAgeDefault
-	config.qrMinHeadAge = qrMinHeadAgeDefault
-
 	// Don't bother creating the registry if UseNilMetrics is set, or
 	// if we're in minimal mode.
-	if !metrics.UseNilMetrics && config.Mode() != InitMinimal {
+	if !metrics.UseNilMetrics && config.Mode().MetricsEnabled() {
 		registry := metrics.NewRegistry()
 		config.SetMetricsRegistry(registry)
 	}
@@ -413,20 +444,7 @@ func NewConfigLocal(mode InitMode, loggerFn func(module string) logger.Logger,
 	config.defaultBlockType = defaultBlockTypeDefault
 	config.quotaUsage =
 		make(map[keybase1.UserOrTeamID]*EventuallyConsistentQuotaUsage)
-
-	switch config.mode.Mode() {
-	case InitDefault:
-		// In normal desktop app, we limit to 16 routines.
-		config.rekeyFSMLimiter = NewOngoingWorkLimiter(16)
-	case InitMinimal:
-		// This is likely mobile. Limit it to 4.
-		config.rekeyFSMLimiter = NewOngoingWorkLimiter(4)
-	case InitSingleOp:
-		// Just block all rekeys and don't bother cleaning up requests since the process is short lived anyway.
-		config.rekeyFSMLimiter = NewOngoingWorkLimiter(0)
-	default:
-		panic(fmt.Sprintf("😱 unknown init mode %v", config.mode))
-	}
+	config.rekeyFSMLimiter = NewOngoingWorkLimiter(config.Mode().RekeyWorkers())
 
 	return config
 }
@@ -578,6 +596,13 @@ func (c *ConfigLocal) Crypto() Crypto {
 	return c.crypto
 }
 
+// Chat implements the Config interface for ConfigLocal.
+func (c *ConfigLocal) Chat() Chat {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.chat
+}
+
 // Signer implements the Config interface for ConfigLocal.
 func (c *ConfigLocal) Signer() kbfscrypto.Signer {
 	c.lock.RLock()
@@ -590,6 +615,13 @@ func (c *ConfigLocal) SetCrypto(cr Crypto) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	c.crypto = cr
+}
+
+// SetChat implements the Config interface for ConfigLocal.
+func (c *ConfigLocal) SetChat(ch Chat) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.chat = ch
 }
 
 // CryptoPure implements the Config interface for ConfigLocal.
@@ -782,6 +814,20 @@ func (c *ConfigLocal) SetConflictRenamer(cr ConflictRenamer) {
 	c.renamer = cr
 }
 
+// UserHistory implements the Config interface for ConfigLocal.
+func (c *ConfigLocal) UserHistory() *kbfsedits.UserHistory {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.userHistory
+}
+
+// SetUserHistory implements the Config interface for ConfigLocal.
+func (c *ConfigLocal) SetUserHistory(uh *kbfsedits.UserHistory) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.userHistory = uh
+}
+
 // MetadataVersion implements the Config interface for ConfigLocal.
 func (c *ConfigLocal) MetadataVersion() kbfsmd.MetadataVer {
 	c.lock.RLock()
@@ -817,9 +863,7 @@ func (c *ConfigLocal) SetDefaultBlockType(blockType keybase1.BlockType) {
 
 // DoBackgroundFlushes implements the Config interface for ConfigLocal.
 func (c *ConfigLocal) DoBackgroundFlushes() bool {
-	if c.Mode() == InitMinimal {
-		// Don't do background flushes when in minimal mode, since
-		// there shouldn't be any data writes.
+	if !c.Mode().BackgroundFlushesEnabled() {
 		return false
 	}
 
@@ -853,13 +897,12 @@ func (c *ConfigLocal) SetRekeyWithPromptWaitTime(d time.Duration) {
 
 // Mode implements the Config interface for ConfigLocal.
 func (c *ConfigLocal) Mode() InitMode {
-	// We return the mode with the test flag masked out.
-	return c.mode.Mode()
+	return c.mode
 }
 
 // IsTestMode implements the Config interface for ConfigLocal.
 func (c *ConfigLocal) IsTestMode() bool {
-	return c.mode.HasFlags(InitTest)
+	return c.mode.IsTestMode()
 }
 
 // DelayedCancellationGracePeriod implements the Config interface for ConfigLocal.
@@ -870,21 +913,6 @@ func (c *ConfigLocal) DelayedCancellationGracePeriod() time.Duration {
 // SetDelayedCancellationGracePeriod implements the Config interface for ConfigLocal.
 func (c *ConfigLocal) SetDelayedCancellationGracePeriod(d time.Duration) {
 	c.delayedCancellationGracePeriod = d
-}
-
-// QuotaReclamationPeriod implements the Config interface for ConfigLocal.
-func (c *ConfigLocal) QuotaReclamationPeriod() time.Duration {
-	return c.qrPeriod
-}
-
-// QuotaReclamationMinUnrefAge implements the Config interface for ConfigLocal.
-func (c *ConfigLocal) QuotaReclamationMinUnrefAge() time.Duration {
-	return c.qrUnrefAge
-}
-
-// QuotaReclamationMinHeadAge implements the Config interface for ConfigLocal.
-func (c *ConfigLocal) QuotaReclamationMinHeadAge() time.Duration {
-	return c.qrMinHeadAge
 }
 
 // ReqsBufSize implements the Config interface for ConfigLocal.
@@ -927,9 +955,7 @@ func (c *ConfigLocal) resetCachesWithoutShutdown() DirtyBlockCache {
 	}
 	c.bcache = NewBlockCacheStandard(10000, capacity)
 
-	if c.Mode() == InitMinimal {
-		// No blocks will be dirtied in minimal mode, so don't bother
-		// with the dirty block cache.
+	if !c.Mode().DirtyBlockCacheEnabled() {
 		return nil
 	}
 
@@ -1095,6 +1121,9 @@ func (c *ConfigLocal) Shutdown(ctx context.Context) error {
 			kbfsOps, ok := config.KBFSOps().(*KBFSOpsStandard)
 			if !ok {
 				continue
+			}
+			if err := kbfsOps.shutdownEdits(ctx); err != nil {
+				return err
 			}
 			for _, fbo := range kbfsOps.ops {
 				if err := fbo.fbm.waitForArchives(ctx); err != nil {
@@ -1290,6 +1319,9 @@ func (c *ConfigLocal) EnableJournaling(
 		if err != nil {
 			return err
 		}
+
+		wg := jServer.MakeFBOsForExistingJournals(ctx)
+		wg.Wait()
 		return nil
 	}()
 	switch {

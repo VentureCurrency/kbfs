@@ -142,7 +142,7 @@ func (k *KBPKIClient) hasVerifyingKey(ctx context.Context, uid keybase1.UID,
 		}
 	}
 
-	t, ok := userInfo.RevokedVerifyingKeys[verifyingKey]
+	info, ok := userInfo.RevokedVerifyingKeys[verifyingKey]
 	if !ok {
 		return false, nil
 	}
@@ -152,39 +152,19 @@ func (k *KBPKIClient) hasVerifyingKey(ctx context.Context, uid keybase1.UID,
 	// keep accepting writes from the revoked device for a short
 	// period of time until it learns about the revoke.
 	const revokeSlack = 1 * time.Minute
-	revokedTime := keybase1.FromTime(t.Unix)
-	// Trust the server times -- if the key was valid at the given
-	// time, we are good to go.  TODO: use Merkle data to check
-	// the server timestamps, to prove the server isn't lying.
+	revokedTime := keybase1.FromTime(info.Time)
+	// Check the server times -- if the key was valid at the given
+	// time, the caller can proceed with their merkle checking if
+	// desired.
 	if atServerTime.Before(revokedTime.Add(revokeSlack)) {
-		k.log.CDebugf(ctx, "Trusting revoked verifying key %s for user %s "+
-			"(revoked time: %v vs. server time %v, slack=%s)",
+		k.log.CDebugf(ctx, "Revoked verifying key %s for user %s passes time "+
+			"check (revoked time: %v vs. server time %v, slack=%s)",
 			verifyingKey.KID(), uid, revokedTime, atServerTime, revokeSlack)
-		return true, nil
+		return false, RevokedDeviceVerificationError{info}
 	}
 	k.log.CDebugf(ctx, "Not trusting revoked verifying key %s for "+
 		"user %s (revoked time: %v vs. server time %v, slack=%s)",
 		verifyingKey.KID(), uid, revokedTime, atServerTime, revokeSlack)
-	return false, nil
-}
-
-func (k *KBPKIClient) hasUnverifiedVerifyingKey(
-	ctx context.Context, uid keybase1.UID,
-	verifyingKey kbfscrypto.VerifyingKey) (bool, error) {
-	keys, err := k.loadUnverifiedKeys(ctx, uid)
-	if err != nil {
-		return false, err
-	}
-
-	for _, key := range keys {
-		if !verifyingKey.KID().Equal(key.KID) {
-			continue
-		}
-		k.log.CDebugf(ctx, "Trusting potentially unverified key %s for user %s",
-			verifyingKey.KID(), uid)
-		return true, nil
-	}
-
 	return false, nil
 }
 
@@ -214,28 +194,6 @@ func (k *KBPKIClient) HasVerifyingKey(ctx context.Context, uid keybase1.UID,
 	return nil
 }
 
-// HasUnverifiedVerifyingKey implements the KBPKI interface for KBPKIClient.
-func (k *KBPKIClient) HasUnverifiedVerifyingKey(
-	ctx context.Context, uid keybase1.UID,
-	verifyingKey kbfscrypto.VerifyingKey) error {
-	ok, err := k.hasUnverifiedVerifyingKey(ctx, uid, verifyingKey)
-	if err != nil {
-		return err
-	}
-	if ok {
-		return nil
-	}
-	k.serviceOwner.KeybaseService().FlushUserUnverifiedKeysFromLocalCache(ctx, uid)
-	ok, err = k.hasUnverifiedVerifyingKey(ctx, uid, verifyingKey)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return VerifyingKeyNotFoundError{verifyingKey}
-	}
-	return nil
-}
-
 func (k *KBPKIClient) loadUserPlusKeys(ctx context.Context,
 	uid keybase1.UID, pollForKID keybase1.KID) (UserInfo, error) {
 	return k.serviceOwner.KeybaseService().LoadUserPlusKeys(ctx, uid, pollForKID)
@@ -256,7 +214,8 @@ func (k *KBPKIClient) GetTeamTLFCryptKeys(
 	ctx context.Context, tid keybase1.TeamID, desiredKeyGen kbfsmd.KeyGen) (
 	map[kbfsmd.KeyGen]kbfscrypto.TLFCryptKey, kbfsmd.KeyGen, error) {
 	teamInfo, err := k.serviceOwner.KeybaseService().LoadTeamPlusKeys(
-		ctx, tid, desiredKeyGen, keybase1.UserVersion{}, keybase1.TeamRole_NONE)
+		ctx, tid, tlf.Unknown, desiredKeyGen, keybase1.UserVersion{},
+		kbfscrypto.VerifyingKey{}, keybase1.TeamRole_NONE)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -265,8 +224,16 @@ func (k *KBPKIClient) GetTeamTLFCryptKeys(
 
 // GetCurrentMerkleRoot implements the KBPKI interface for KBPKIClient.
 func (k *KBPKIClient) GetCurrentMerkleRoot(ctx context.Context) (
-	keybase1.MerkleRootV2, error) {
+	keybase1.MerkleRootV2, time.Time, error) {
 	return k.serviceOwner.KeybaseService().GetCurrentMerkleRoot(ctx)
+}
+
+// VerifyMerkleRoot implements the KBPKI interface for KBPKIClient.
+func (k *KBPKIClient) VerifyMerkleRoot(
+	ctx context.Context, root keybase1.MerkleRootV2,
+	kbfsRoot keybase1.KBFSRoot) error {
+	return k.serviceOwner.KeybaseService().VerifyMerkleRoot(
+		ctx, root, kbfsRoot)
 }
 
 // IsTeamWriter implements the KBPKI interface for KBPKIClient.
@@ -313,7 +280,8 @@ func (k *KBPKIClient) IsTeamWriter(
 		EldestSeqno: userInfo.EldestSeqno,
 	}
 	teamInfo, err := k.serviceOwner.KeybaseService().LoadTeamPlusKeys(
-		ctx, tid, kbfsmd.UnspecifiedKeyGen, desiredUser, keybase1.TeamRole_WRITER)
+		ctx, tid, tlf.Unknown, kbfsmd.UnspecifiedKeyGen, desiredUser,
+		kbfscrypto.VerifyingKey{}, keybase1.TeamRole_WRITER)
 	if err != nil {
 		if tid.IsPublic() {
 			if _, notFound := err.(libkb.NotFoundError); notFound {
@@ -328,16 +296,62 @@ func (k *KBPKIClient) IsTeamWriter(
 	return teamInfo.Writers[uid], nil
 }
 
+// NoLongerTeamWriter implements the KBPKI interface for KBPKIClient.
+func (k *KBPKIClient) NoLongerTeamWriter(
+	ctx context.Context, tid keybase1.TeamID, tlfType tlf.Type,
+	uid keybase1.UID, verifyingKey kbfscrypto.VerifyingKey) (
+	keybase1.MerkleRootV2, error) {
+	if uid.IsNil() || verifyingKey.IsNil() {
+		// A sessionless user can never be a writer.
+		return keybase1.MerkleRootV2{}, nil
+	}
+
+	// We don't need the eldest seqno when we look up an older writer,
+	// the service takes care of that for us.
+	desiredUser := keybase1.UserVersion{
+		Uid: uid,
+	}
+
+	teamInfo, err := k.serviceOwner.KeybaseService().LoadTeamPlusKeys(
+		ctx, tid, tlfType, kbfsmd.UnspecifiedKeyGen, desiredUser,
+		verifyingKey, keybase1.TeamRole_WRITER)
+	if err != nil {
+		return keybase1.MerkleRootV2{}, err
+	}
+	return teamInfo.LastWriters[verifyingKey], nil
+}
+
 // IsTeamReader implements the KBPKI interface for KBPKIClient.
 func (k *KBPKIClient) IsTeamReader(
 	ctx context.Context, tid keybase1.TeamID, uid keybase1.UID) (bool, error) {
 	desiredUser := keybase1.UserVersion{Uid: uid}
 	teamInfo, err := k.serviceOwner.KeybaseService().LoadTeamPlusKeys(
-		ctx, tid, kbfsmd.UnspecifiedKeyGen, desiredUser, keybase1.TeamRole_READER)
+		ctx, tid, tlf.Unknown, kbfsmd.UnspecifiedKeyGen, desiredUser,
+		kbfscrypto.VerifyingKey{}, keybase1.TeamRole_READER)
 	if err != nil {
 		return false, err
 	}
 	return tid.IsPublic() || teamInfo.Writers[uid] || teamInfo.Readers[uid], nil
+}
+
+// ListResolvedTeamMembers implements the KBPKI interface for KBPKIClient.
+func (k *KBPKIClient) ListResolvedTeamMembers(
+	ctx context.Context, tid keybase1.TeamID) (
+	writers, readers []keybase1.UID, err error) {
+	teamInfo, err := k.serviceOwner.KeybaseService().LoadTeamPlusKeys(
+		ctx, tid, tlf.Unknown, kbfsmd.UnspecifiedKeyGen, keybase1.UserVersion{},
+		kbfscrypto.VerifyingKey{}, keybase1.TeamRole_NONE)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for w := range teamInfo.Writers {
+		writers = append(writers, w)
+	}
+	for r := range teamInfo.Readers {
+		readers = append(readers, r)
+	}
+	return writers, readers, nil
 }
 
 // GetTeamRootID implements the KBPKI interface for KBPKIClient.
@@ -348,8 +362,8 @@ func (k *KBPKIClient) GetTeamRootID(ctx context.Context, tid keybase1.TeamID) (
 	}
 
 	teamInfo, err := k.serviceOwner.KeybaseService().LoadTeamPlusKeys(
-		ctx, tid, kbfsmd.UnspecifiedKeyGen, keybase1.UserVersion{},
-		keybase1.TeamRole_NONE)
+		ctx, tid, tlf.Unknown, kbfsmd.UnspecifiedKeyGen, keybase1.UserVersion{},
+		kbfscrypto.VerifyingKey{}, keybase1.TeamRole_NONE)
 	if err != nil {
 		return keybase1.TeamID(""), err
 	}
@@ -383,9 +397,10 @@ func (k *KBPKIClient) Notify(ctx context.Context, notification *keybase1.FSNotif
 	return k.serviceOwner.KeybaseService().Notify(ctx, notification)
 }
 
-func (k *KBPKIClient) loadUnverifiedKeys(ctx context.Context, uid keybase1.UID) (
-	[]keybase1.PublicKey, error) {
-	return k.serviceOwner.KeybaseService().LoadUnverifiedKeys(ctx, uid)
+// NotifyPathUpdated implements the KBPKI interface for KBPKIClient.
+func (k *KBPKIClient) NotifyPathUpdated(
+	ctx context.Context, path string) error {
+	return k.serviceOwner.KeybaseService().NotifyPathUpdated(ctx, path)
 }
 
 // PutGitMetadata implements the KBPKI interface for KBPKIClient.

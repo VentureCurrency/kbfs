@@ -80,6 +80,17 @@ func (f *JSONFile) Load(warnOnNotFound bool) error {
 		return err
 	}
 	f.jw = jsonw.NewWrapper(obj)
+
+	if runtime.GOOS == "android" {
+		// marshal it into json without indents to make it one line
+		out, err := json.Marshal(obj)
+		if err != nil {
+			f.G().Log.Debug("JSONFile.Load: error marshaling decoded config obj: %s", err)
+		} else {
+			f.G().Log.Debug("JSONFile.Load: %s contents (marshaled): %s", f.filename, string(out))
+		}
+	}
+
 	f.G().Log.Debug("- successfully loaded %s file", f.which)
 	return nil
 }
@@ -261,6 +272,37 @@ func (f *JSONFile) save() (err error) {
 			return fmt.Errorf("file info size (%d) does not match encoded len (%d)", info.Size(), len(encoded))
 		}
 
+		// write out the `dat` that was marshaled into filename
+		encodedForLog, err := json.Marshal(dat)
+		if err != nil {
+			f.G().Log.Debug("error marshaling for log dump: %s", err)
+		} else {
+			f.G().Log.Debug("data written to %s:", filename)
+			f.G().Log.Debug(string(encodedForLog))
+		}
+
+		// load the file and dump its contents to the log
+		fc, err := os.Open(filename)
+		if err != nil {
+			f.G().Log.Debug("error opening %s to check its contents: %s", filename, err)
+		} else {
+			defer fc.Close()
+
+			decoder := json.NewDecoder(fc)
+			obj := make(map[string]interface{})
+			if err := decoder.Decode(&obj); err != nil {
+				f.G().Log.Debug("error decoding %s: %s", filename, err)
+			} else {
+				// marshal it into json without indents to make it one line
+				out, err := json.Marshal(obj)
+				if err != nil {
+					f.G().Log.Debug("error marshaling decoded obj: %s", err)
+				} else {
+					f.G().Log.Debug("%s contents (marshaled): %s", filename, string(out))
+				}
+			}
+		}
+
 		f.G().Log.Debug("| Android extra checks done")
 	}
 
@@ -290,5 +332,105 @@ func (f *jsonFileTransaction) Commit() (err error) {
 	}
 	f.f.setTx(nil)
 
+	return err
+}
+
+type valueGetter func(*jsonw.Wrapper) (interface{}, error)
+
+func (f *JSONFile) getValueAtPath(p string, getter valueGetter) (ret interface{}, isSet bool) {
+	var err error
+	ret, err = getter(f.jw.AtPath(p))
+	if err == nil {
+		isSet = true
+	}
+	return ret, isSet
+}
+
+func getString(w *jsonw.Wrapper) (interface{}, error) {
+	return w.GetString()
+}
+
+func getBool(w *jsonw.Wrapper) (interface{}, error) {
+	return w.GetBool()
+}
+
+func getInt(w *jsonw.Wrapper) (interface{}, error) {
+	return w.GetInt()
+}
+
+func (f *JSONFile) GetFilename() string {
+	return f.filename
+}
+
+func (f *JSONFile) GetInterfaceAtPath(p string) (i interface{}, err error) {
+	return f.jw.AtPath(p).GetInterface()
+}
+
+func (f *JSONFile) GetStringAtPath(p string) (ret string, isSet bool) {
+	i, isSet := f.getValueAtPath(p, getString)
+	if isSet {
+		ret = i.(string)
+	}
+	return ret, isSet
+}
+
+func (f *JSONFile) GetBoolAtPath(p string) (ret bool, isSet bool) {
+	i, isSet := f.getValueAtPath(p, getBool)
+	if isSet {
+		ret = i.(bool)
+	}
+	return ret, isSet
+}
+
+func (f *JSONFile) GetIntAtPath(p string) (ret int, isSet bool) {
+	i, isSet := f.getValueAtPath(p, getInt)
+	if isSet {
+		ret = i.(int)
+	}
+	return ret, isSet
+}
+
+func (f *JSONFile) GetNullAtPath(p string) (isSet bool) {
+	w := f.jw.AtPath(p)
+	isSet = w.IsNil() && w.Error() == nil
+	return isSet
+}
+
+func (f *JSONFile) setValueAtPath(p string, getter valueGetter, v interface{}) error {
+	existing, err := getter(f.jw.AtPath(p))
+
+	if err != nil || existing != v {
+		err = f.jw.SetValueAtPath(p, jsonw.NewWrapper(v))
+		if err == nil {
+			return f.Save()
+		}
+	}
+	return err
+}
+
+func (f *JSONFile) SetStringAtPath(p string, v string) error {
+	return f.setValueAtPath(p, getString, v)
+}
+
+func (f *JSONFile) SetBoolAtPath(p string, v bool) error {
+	return f.setValueAtPath(p, getBool, v)
+}
+
+func (f *JSONFile) SetIntAtPath(p string, v int) error {
+	return f.setValueAtPath(p, getInt, v)
+}
+
+func (f *JSONFile) SetInt64AtPath(p string, v int64) error {
+	return f.setValueAtPath(p, getInt, v)
+}
+
+func (f *JSONFile) SetNullAtPath(p string) (err error) {
+	existing := f.jw.AtPath(p)
+	if !existing.IsNil() || existing.Error() != nil {
+		err = f.jw.SetValueAtPath(p, jsonw.NewNil())
+		if err == nil {
+			return f.Save()
+		}
+	}
 	return err
 }

@@ -165,12 +165,12 @@ func TestJournalServerOverQuotaError(t *testing.T) {
 
 	// Set initial quota usage and refresh quotaUsage's cache.
 	qbs.setUserQuotaInfo(1010, 1000, 2010, 2000)
-	_, _, _, err = quotaUsage.Get(ctx, 0, 0)
+	_, _, _, _, err = quotaUsage.Get(ctx, 0, 0)
 	require.NoError(t, err)
 
 	// Set team quota to be under the limit for now.
 	qbs.setTeamQuotaInfo(teamID, 0, 1000)
-	_, _, _, err = teamQuotaUsage.Get(ctx, 0, 0)
+	_, _, _, _, err = teamQuotaUsage.Get(ctx, 0, 0)
 	require.NoError(t, err)
 
 	tlfID1 := tlf.FakeID(1, tlf.Private)
@@ -239,7 +239,7 @@ func TestJournalServerOverQuotaError(t *testing.T) {
 	// Now up the team usage, so teams (and their subteams) should get
 	// an error.
 	qbs.setTeamQuotaInfo(teamID, 1010, 1000)
-	_, _, _, err = teamQuotaUsage.Get(ctx, 0, 0)
+	_, _, _, _, err = teamQuotaUsage.Get(ctx, 0, 0)
 	require.NoError(t, err)
 	clock.Add(time.Minute)
 	err = blockServer.Put(ctx, tlfID2, bID, bCtx, data, serverHalf)
@@ -278,7 +278,7 @@ func TestJournalServerOverDiskLimitError(t *testing.T) {
 
 	// Set initial quota usage and refresh quotaUsage's cache.
 	qbs.setUserQuotaInfo(1010, 1000, 2010, 2000)
-	_, _, _, err := quotaUsage.Get(ctx, 0, 0)
+	_, _, _, _, err := quotaUsage.Get(ctx, 0, 0)
 	require.NoError(t, err)
 
 	tlfID1 := tlf.FakeID(1, tlf.Private)
@@ -488,8 +488,9 @@ func TestJournalServerLogOutLogIn(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ImmutableRootMetadata{}, head)
 
-	serviceLoggedIn(
+	wg := serviceLoggedIn(
 		ctx, config, session, TLFJournalBackgroundWorkPaused)
+	wg.Wait()
 
 	// Get the block.
 
@@ -529,7 +530,7 @@ func TestJournalServerLogOutDirtyOp(t *testing.T) {
 	dirtyOps := func() uint {
 		jServer.lock.RLock()
 		defer jServer.lock.RUnlock()
-		return jServer.dirtyOps
+		return jServer.dirtyOps[tlfID]
 	}
 	require.NotEqual(t, 0, dirtyOps)
 }
@@ -593,8 +594,9 @@ func TestJournalServerMultiUser(t *testing.T) {
 
 	session, err = config.KBPKI().GetCurrentSession(ctx)
 	require.NoError(t, err)
-	serviceLoggedIn(
+	wg := serviceLoggedIn(
 		ctx, config, session, TLFJournalBackgroundWorkPaused)
+	wg.Wait()
 
 	err = jServer.Enable(ctx, tlfID, nil, TLFJournalBackgroundWorkPaused)
 	require.NoError(t, err)
@@ -655,8 +657,9 @@ func TestJournalServerMultiUser(t *testing.T) {
 
 	session, err = config.KBPKI().GetCurrentSession(ctx)
 	require.NoError(t, err)
-	serviceLoggedIn(
+	wg = serviceLoggedIn(
 		ctx, config, session, TLFJournalBackgroundWorkPaused)
+	wg.Wait()
 
 	// Only user 1's block and MD should be visible.
 
@@ -681,8 +684,9 @@ func TestJournalServerMultiUser(t *testing.T) {
 
 	session, err = config.KBPKI().GetCurrentSession(ctx)
 	require.NoError(t, err)
-	serviceLoggedIn(
+	wg = serviceLoggedIn(
 		ctx, config, session, TLFJournalBackgroundWorkPaused)
+	wg.Wait()
 
 	// Only user 2's block and MD should be visible.
 
@@ -717,6 +721,8 @@ func TestJournalServerEnableAuto(t *testing.T) {
 	require.NoError(t, err)
 	id := h.ResolvedWriters()[0]
 	tlfID := h.tlfID
+
+	jServer.PauseBackgroundWork(ctx, tlfID)
 
 	bCtx := kbfsblock.MakeFirstContext(id, keybase1.BlockType_DATA)
 	data := []byte{1, 2, 3, 4}

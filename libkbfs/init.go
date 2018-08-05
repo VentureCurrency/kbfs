@@ -32,7 +32,13 @@ const (
 	// InitSingleOpString is for when KBFS will only be used for a
 	// single logical operation (e.g., as a git remote helper).
 	InitSingleOpString = "singleOp"
+	// InitConstrainedString is for when KBFS will use constrained
+	// resources.
+	InitConstrainedString = "constrained"
 )
+
+// AdditionalProtocolCreator creates an additional protocol.
+type AdditionalProtocolCreator func(Context, Config) (rpc.Protocol, error)
 
 // InitParams contains the initialization parameters for Init(). It is
 // usually filled in by the flags parser passed into AddFlags().
@@ -83,13 +89,9 @@ type InitParams struct {
 	// EnableJournal is non-empty.
 	TLFJournalBackgroundWorkStatus TLFJournalBackgroundWorkStatus
 
-	// CreateSimpleFSInstance creates a SimpleFSInterface from config.
-	// If this is nil then simplefs will be omitted in the rpc api.
-	CreateSimpleFSInstance func(Config) keybase1.SimpleFSInterface
-
-	// CreateGitHandlerInstance creates a KBFSGitInterface from config.
-	// If this is nil then git will be omitted in the rpc api.
-	CreateGitHandlerInstance func(Config) keybase1.KBFSGitInterface
+	// AdditionalProtocolCreators are for adding additional protocols that we
+	// should handle for service to call in.
+	AdditionalProtocolCreators []AdditionalProtocolCreator
 
 	// EnableJournal enables journaling.
 	EnableJournal bool
@@ -267,8 +269,8 @@ func AddFlagsWithDefaults(
 		"Metadata version to use when creating new metadata")
 	flags.StringVar(&params.Mode, "mode", defaultParams.Mode,
 		fmt.Sprintf("Overall initialization mode for KBFS, indicating how "+
-			"heavy-weight it can be (%s, %s or %s)", InitDefaultString,
-			InitMinimalString, InitSingleOpString))
+			"heavy-weight it can be (%s, %s, %s or %s)", InitDefaultString,
+			InitMinimalString, InitSingleOpString, InitConstrainedString))
 
 	return &params
 }
@@ -562,23 +564,29 @@ func doInit(
 	case InitSingleOpString:
 		log.CDebugf(ctx, "Initializing in singleOp mode")
 		mode = InitSingleOp
+	case InitConstrainedString:
+		log.CDebugf(ctx, "Initializing in constrained mode")
+		mode = InitConstrained
 	default:
 		return nil, fmt.Errorf("Unexpected mode: %s", params.Mode)
 	}
 
-	config := NewConfigLocal(mode, func(module string) logger.Logger {
-		mname := logPrefix
-		if module != "" {
-			mname += fmt.Sprintf("(%s)", module)
-		}
-		lg := logger.New(mname)
-		if params.Debug {
-			// Turn on debugging.  TODO: allow a proper log file and
-			// style to be specified.
-			lg.Configure("", true, "")
-		}
-		return lg
-	}, params.StorageRoot, params.DiskCacheMode, kbCtx)
+	initMode := NewInitModeFromType(mode)
+
+	config := NewConfigLocal(initMode,
+		func(module string) logger.Logger {
+			mname := logPrefix
+			if module != "" {
+				mname += fmt.Sprintf("(%s)", module)
+			}
+			lg := logger.New(mname)
+			if params.Debug {
+				// Turn on debugging.  TODO: allow a proper log file and
+				// style to be specified.
+				lg.Configure("", true, "")
+			}
+			return lg
+		}, params.StorageRoot, params.DiskCacheMode, kbCtx)
 
 	if params.CleanBlockCacheCapacity > 0 {
 		log.CDebugf(
@@ -589,14 +597,8 @@ func doInit(
 			params.CleanBlockCacheCapacity)
 	}
 
-	workers := defaultBlockRetrievalWorkerQueueSize
-	prefetchWorkers := defaultPrefetchWorkerQueueSize
-	if config.Mode() == InitMinimal {
-		// In minimal mode, block re-embedding is not required, so we don't
-		// fetch the unembedded blocks..
-		workers = 0
-		prefetchWorkers = 0
-	}
+	workers := config.Mode().BlockWorkers()
+	prefetchWorkers := config.Mode().PrefetchWorkers()
 	config.SetBlockOps(NewBlockOpsStandard(config, workers, prefetchWorkers))
 
 	bsplitter, err := NewBlockSplitterSimple(MaxBlockSizeBytesDefault, 8*1024,
@@ -620,12 +622,6 @@ func doInit(
 	config.SetTLFValidDuration(params.TLFValidDuration)
 	config.SetBGFlushPeriod(params.BGFlushPeriod)
 
-	kbfsOps := NewKBFSOpsStandard(config)
-	config.SetKBFSOps(kbfsOps)
-	config.SetNotifier(kbfsOps)
-	config.SetKeyManager(NewKeyManagerStandard(config))
-	config.SetMDOps(NewMDOpsStandard(config))
-
 	kbfsLog := config.MakeLogger("")
 
 	// Initialize Keybase service connection
@@ -637,14 +633,28 @@ func doInit(
 	if err != nil {
 		return nil, fmt.Errorf("problem creating service: %s", err)
 	}
+
+	// Initialize Chat client (for file edit notifications).
+	chat, err := keybaseServiceCn.NewChat(config, params, kbCtx, kbfsLog)
+	if err != nil {
+		return nil, fmt.Errorf("problem creating chat: %s", err)
+	}
+	config.SetChat(chat)
+
+	// Initialize KBPKI client (needed for KBFSOps and MD Server).
+	k := NewKBPKIClient(config, kbfsLog)
+	config.SetKBPKI(k)
+
+	kbfsOps := NewKBFSOpsStandard(kbCtx.GetGlobalContext(), config)
+	config.SetKBFSOps(kbfsOps)
+	config.SetNotifier(kbfsOps)
+	config.SetKeyManager(NewKeyManagerStandard(config))
+	config.SetMDOps(NewMDOpsStandard(config))
+
 	if registry := config.MetricsRegistry(); registry != nil {
 		service = NewKeybaseServiceMeasured(service, registry)
 	}
 	config.SetKeybaseService(service)
-
-	// Initialize KBPKI client (needed for MD Server).
-	k := NewKBPKIClient(config, kbfsLog)
-	config.SetKBPKI(k)
 
 	config.SetReporter(NewReporterKBPKI(config, 10, 1000))
 
@@ -699,7 +709,7 @@ func doInit(
 			params.DiskCacheMode.String())
 	}
 
-	if config.Mode() == InitDefault {
+	if config.Mode().KBFSServiceEnabled() {
 		// Initialize kbfsService only when we run a full KBFS process.
 		// This requires the disk block cache to have been initialized, if it
 		// should be initialized.
@@ -722,7 +732,7 @@ func doInit(
 	defer cancel()
 	// TODO: Don't turn on journaling if either -bserver or
 	// -mdserver point to local implementations.
-	if params.EnableJournal && config.Mode() != InitMinimal {
+	if params.EnableJournal && config.Mode().JournalEnabled() {
 		journalRoot := filepath.Join(params.StorageRoot, "kbfs_journal")
 		err = config.EnableJournaling(ctx10s, journalRoot,
 			params.TLFJournalBackgroundWorkStatus)

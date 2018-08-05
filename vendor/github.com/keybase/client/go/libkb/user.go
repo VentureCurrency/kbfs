@@ -4,14 +4,15 @@
 package libkb
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"regexp"
 
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
+	stellar1 "github.com/keybase/client/go/protocol/stellar1"
 	jsonw "github.com/keybase/go-jsonw"
-	"golang.org/x/net/context"
 )
 
 type UserBasic interface {
@@ -109,6 +110,18 @@ func (u *User) GetName() string                       { return u.name }
 func (u *User) GetUID() keybase1.UID                  { return u.id }
 func (u *User) GetStatus() keybase1.StatusCode        { return u.status }
 
+func (u *User) GetSalt() (salt []byte, err error) {
+	saltHex, err := u.basics.AtKey("salt").GetString()
+	if err != nil {
+		return nil, err
+	}
+	salt, err = hex.DecodeString(saltHex)
+	if err != nil {
+		return nil, err
+	}
+	return salt, nil
+}
+
 func (u *User) GetIDVersion() (int64, error) {
 	return u.basics.AtKey("id_version").GetInt64()
 }
@@ -118,6 +131,13 @@ func (u *User) GetSigChainLastKnownSeqno() keybase1.Seqno {
 		return 0
 	}
 	return u.sigChain().GetLastKnownSeqno()
+}
+
+func (u *User) GetSigChainLastKnownID() LinkID {
+	if u.sigChain() == nil {
+		return nil
+	}
+	return u.sigChain().GetLastKnownID()
 }
 
 func (u *User) GetCurrentEldestSeqno() keybase1.Seqno {
@@ -267,25 +287,24 @@ func (u *User) CheckBasicsFreshness(server int64) (current bool, err error) {
 	return
 }
 
-func (u *User) StoreSigChain(ctx context.Context) error {
+func (u *User) StoreSigChain(m MetaContext) error {
 	var err error
 	if u.sigChain() != nil {
-		err = u.sigChain().Store(ctx)
+		err = u.sigChain().Store(m)
 	}
 	return err
 }
 
-func (u *User) LoadSigChains(ctx context.Context, f *MerkleUserLeaf, self bool) (err error) {
+func (u *User) LoadSigChains(m MetaContext, f *MerkleUserLeaf, self bool) (err error) {
 	defer TimeLog(fmt.Sprintf("LoadSigChains: %s", u.name), u.G().Clock().Now(), u.G().Log.Debug)
 
 	loader := SigChainLoader{
-		user:         u,
-		self:         self,
-		leaf:         f,
-		chainType:    PublicChain,
-		Contextified: u.Contextified,
-		preload:      u.sigChain(),
-		ctx:          ctx,
+		user:             u,
+		self:             self,
+		leaf:             f,
+		chainType:        PublicChain,
+		preload:          u.sigChain(),
+		MetaContextified: NewMetaContextified(m),
 	}
 
 	u.sigChainMem, err = loader.Load()
@@ -294,37 +313,37 @@ func (u *User) LoadSigChains(ctx context.Context, f *MerkleUserLeaf, self bool) 
 	return err
 }
 
-func (u *User) Store(ctx context.Context) error {
+func (u *User) Store(m MetaContext) error {
 
-	u.G().Log.CDebugf(ctx, "+ Store user %s", u.name)
+	m.CDebugf("+ Store user %s", u.name)
 
 	// These might be dirty, in which case we can write it back
 	// to local storage. Note, this can be dirty even if the user is clean.
-	if err := u.sigHints.Store(ctx); err != nil {
+	if err := u.sigHints.Store(m); err != nil {
 		return err
 	}
 
 	if !u.dirty {
-		u.G().Log.CDebugf(ctx, "- Store for %s skipped; user wasn't dirty", u.name)
+		m.CDebugf("- Store for %s skipped; user wasn't dirty", u.name)
 		return nil
 	}
 
-	if err := u.StoreSigChain(ctx); err != nil {
+	if err := u.StoreSigChain(m); err != nil {
 		return err
 	}
 
-	if err := u.StoreTopLevel(ctx); err != nil {
+	if err := u.StoreTopLevel(m); err != nil {
 		return err
 	}
 
 	u.dirty = false
-	u.G().Log.CDebugf(ctx, "- Store user %s -> OK", u.name)
+	m.CDebugf("- Store user %s -> OK", u.name)
 
 	return nil
 }
 
-func (u *User) StoreTopLevel(ctx context.Context) error {
-	u.G().Log.CDebugf(ctx, "+ StoreTopLevel")
+func (u *User) StoreTopLevel(m MetaContext) error {
+	m.CDebugf("+ StoreTopLevel")
 
 	jw := jsonw.NewDictionary()
 	jw.SetKey("id", UIDWrapper(u.id))
@@ -337,29 +356,26 @@ func (u *User) StoreTopLevel(ctx context.Context) error {
 		[]DbKey{{Typ: DBLookupUsername, Key: u.name}},
 		jw,
 	)
-	u.G().Log.CDebugf(ctx, "- StoreTopLevel -> %s", ErrToOk(err))
+	m.CDebugf("- StoreTopLevel -> %s", ErrToOk(err))
 	return err
 }
 
-func (u *User) SyncedSecretKey(lctx LoginContext) (ret *SKB, err error) {
-	if lctx != nil {
-		return u.getSyncedSecretKeyLogin(lctx)
+func (u *User) SyncedSecretKey(m MetaContext) (ret *SKB, err error) {
+	if lctx := m.LoginContext(); lctx != nil {
+		return u.getSyncedSecretKeyLogin(m, lctx)
 	}
-	return u.GetSyncedSecretKey()
+	return u.GetSyncedSecretKey(m)
 }
 
-func (u *User) getSyncedSecretKeyLogin(lctx LoginContext) (ret *SKB, err error) {
-	u.G().Log.Debug("+ User#GetSyncedSecretKeyLogin()")
-	defer func() {
-		u.G().Log.Debug("- User#GetSyncedSecretKeyLogin() -> %s", ErrToOk(err))
-	}()
+func (u *User) getSyncedSecretKeyLogin(m MetaContext, lctx LoginContext) (ret *SKB, err error) {
+	defer m.CTrace("User#getSyncedSecretKeyLogin", func() error { return err })()
 
-	if err = lctx.RunSecretSyncer(u.id); err != nil {
+	if err = lctx.RunSecretSyncer(m, u.id); err != nil {
 		return
 	}
 	ckf := u.GetComputedKeyFamily()
 	if ckf == nil {
-		u.G().Log.Debug("| short-circuit; no Computed key family")
+		m.CDebugf("| short-circuit; no Computed key family")
 		return
 	}
 
@@ -367,74 +383,53 @@ func (u *User) getSyncedSecretKeyLogin(lctx LoginContext) (ret *SKB, err error) 
 	return
 }
 
-func (u *User) GetSyncedSecretKey() (ret *SKB, err error) {
-	u.G().Log.Debug("+ User#GetSyncedSecretKey()")
-	defer func() {
-		u.G().Log.Debug("- User#GetSyncedSecretKey() -> %s", ErrToOk(err))
-	}()
+func (u *User) GetSyncedSecretKey(m MetaContext) (ret *SKB, err error) {
+	defer m.CTrace("User#GetSyncedSecretKey", func() error { return err })()
 
-	if err = u.SyncSecrets(); err != nil {
+	if err = u.SyncSecrets(m); err != nil {
 		return
 	}
 
 	ckf := u.GetComputedKeyFamily()
 	if ckf == nil {
-		u.G().Log.Debug("| short-circuit; no Computed key family")
+		m.CDebugf("| short-circuit; no Computed key family")
 		return
 	}
 
-	aerr := u.G().LoginState().SecretSyncer(func(s *SecretSyncer) {
-		ret, err = s.FindActiveKey(ckf)
-	}, "User - FindActiveKey")
-	if aerr != nil {
-		return nil, aerr
+	syncer, err := m.SyncSecrets()
+	if err != nil {
+		return nil, err
 	}
 
-	return
+	ret, err = syncer.FindActiveKey(ckf)
+	return ret, err
 }
 
 // AllSyncedSecretKeys returns all the PGP key blocks that were
 // synced to API server.  LoginContext can be nil if this isn't
 // used while logging in, signing up.
-func (u *User) AllSyncedSecretKeys(lctx LoginContext) (keys []*SKB, err error) {
-	u.G().Log.Debug("+ User#AllSyncedSecretKeys()")
-	defer func() {
-		u.G().Log.Debug("- User#AllSyncedSecretKey() -> %s", ErrToOk(err))
-	}()
+func (u *User) AllSyncedSecretKeys(m MetaContext) (keys []*SKB, err error) {
+	defer m.CTrace("User#AllSyncedSecretKeys", func() error { return err })()
+	m.Dump()
 
-	if lctx != nil {
-		if err = lctx.RunSecretSyncer(u.id); err != nil {
-			return nil, err
-		}
-	} else {
-		if err = u.G().LoginState().RunSecretSyncer(u.id); err != nil {
-			return nil, err
-		}
+	ss, err := m.SyncSecretsForUID(u.GetUID())
+	if err != nil {
+		return nil, err
 	}
 
 	ckf := u.GetComputedKeyFamily()
 	if ckf == nil {
-		u.G().Log.Debug("| short-circuit; no Computed key family")
+		m.CDebugf("| short-circuit; no Computed key family")
 		return nil, nil
 	}
 
-	if lctx != nil {
-		keys = lctx.SecretSyncer().AllActiveKeys(ckf)
-		return keys, nil
-	}
-
-	aerr := u.G().LoginState().SecretSyncer(func(s *SecretSyncer) {
-		keys = s.AllActiveKeys(ckf)
-	}, "User - FindActiveKey")
-	if aerr != nil {
-		return nil, aerr
-	}
-
+	keys = ss.AllActiveKeys(ckf)
 	return keys, nil
 }
 
-func (u *User) SyncSecrets() error {
-	return u.G().LoginState().RunSecretSyncer(u.id)
+func (u *User) SyncSecrets(m MetaContext) error {
+	_, err := m.SyncSecretsForUID(u.GetUID())
+	return err
 }
 
 // May return an empty KID
@@ -451,6 +446,15 @@ func (u *User) GetPublicChainTail() *MerkleTriple {
 
 func (u *User) IDTable() *IdentityTable {
 	return u.idTable
+}
+
+// Return the active stellar public address for a user.
+// Returns nil if there is none or it has not been loaded.
+func (u *User) StellarAccountID() *stellar1.AccountID {
+	if u.idTable == nil {
+		return nil
+	}
+	return u.idTable.StellarAccountID()
 }
 
 func (u *User) sigChain() *SigChain {
@@ -528,30 +532,30 @@ func (u *User) Equal(other *User) bool {
 	return u.id == other.id
 }
 
-func (u *User) TmpTrackChainLinkFor(username string, uid keybase1.UID) (tcl *TrackChainLink, err error) {
-	return TmpTrackChainLinkFor(u.id, uid, u.G())
+func (u *User) TmpTrackChainLinkFor(m MetaContext, username string, uid keybase1.UID) (tcl *TrackChainLink, err error) {
+	return TmpTrackChainLinkFor(m, u.id, uid)
 }
 
-func TmpTrackChainLinkFor(me keybase1.UID, them keybase1.UID, g *GlobalContext) (tcl *TrackChainLink, err error) {
-	g.Log.Debug("+ TmpTrackChainLinkFor for %s", them)
-	tcl, err = LocalTmpTrackChainLinkFor(me, them, g)
-	g.Log.Debug("- TmpTrackChainLinkFor for %s -> %v, %v", them, (tcl != nil), err)
+func TmpTrackChainLinkFor(m MetaContext, me keybase1.UID, them keybase1.UID) (tcl *TrackChainLink, err error) {
+	m.CDebugf("+ TmpTrackChainLinkFor for %s", them)
+	tcl, err = LocalTmpTrackChainLinkFor(m, me, them)
+	m.CDebugf("- TmpTrackChainLinkFor for %s -> %v, %v", them, (tcl != nil), err)
 	return tcl, err
 }
 
-func (u *User) TrackChainLinkFor(username NormalizedUsername, uid keybase1.UID) (*TrackChainLink, error) {
+func (u *User) TrackChainLinkFor(m MetaContext, username NormalizedUsername, uid keybase1.UID) (*TrackChainLink, error) {
 	u.G().Log.Debug("+ TrackChainLinkFor for %s", uid)
 	defer u.G().Log.Debug("- TrackChainLinkFor for %s", uid)
 	remote, e1 := u.remoteTrackChainLinkFor(username, uid)
-	return TrackChainLinkFor(u.id, uid, remote, e1, u.G())
+	return TrackChainLinkFor(m, u.id, uid, remote, e1)
 }
 
-func TrackChainLinkFor(me keybase1.UID, them keybase1.UID, remote *TrackChainLink, remoteErr error, g *GlobalContext) (*TrackChainLink, error) {
+func TrackChainLinkFor(m MetaContext, me keybase1.UID, them keybase1.UID, remote *TrackChainLink, remoteErr error) (*TrackChainLink, error) {
 
-	local, e2 := LocalTrackChainLinkFor(me, them, g)
+	local, e2 := LocalTrackChainLinkFor(m, me, them)
 
-	g.Log.Debug("| Load remote -> %v", (remote != nil))
-	g.Log.Debug("| Load local -> %v", (local != nil))
+	m.CDebugf("| Load remote -> %v", (remote != nil))
+	m.CDebugf("| Load local -> %v", (local != nil))
 
 	if remoteErr != nil && e2 != nil {
 		return nil, remoteErr
@@ -566,12 +570,12 @@ func TrackChainLinkFor(me keybase1.UID, them keybase1.UID, remote *TrackChainLin
 	}
 
 	if remote == nil && local != nil {
-		g.Log.Debug("local expire %v: %s", local.tmpExpireTime.IsZero(), local.tmpExpireTime)
+		m.CDebugf("local expire %v: %s", local.tmpExpireTime.IsZero(), local.tmpExpireTime)
 		return local, nil
 	}
 
 	if remote.GetCTime().After(local.GetCTime()) {
-		g.Log.Debug("| Returning newer remote")
+		m.CDebugf("| Returning newer remote")
 		return remote, nil
 	}
 
@@ -587,7 +591,7 @@ func (u *User) remoteTrackChainLinkFor(username NormalizedUsername, uid keybase1
 }
 
 // BaseProofSet creates a basic proof set for a user with their
-// keybase and uid proofs and any pgp fingerpring proofs.
+// keybase and uid proofs and any pgp fingerprint proofs.
 func (u *User) BaseProofSet() *ProofSet {
 	proofs := []Proof{
 		{Key: "keybase", Value: u.name},
@@ -701,7 +705,12 @@ func (u *User) SigningKeyPub() (GenericKey, error) {
 		Me:      u,
 		KeyType: DeviceSigningKeyType,
 	}
-	lockedKey, err := u.G().Keyrings.GetSecretKeyLocked(nil, arg)
+	key := u.G().ActiveDevice.SigningKeyForUID(u.GetUID())
+	if key != nil {
+		return key, nil
+	}
+
+	lockedKey, err := u.G().Keyrings.GetSecretKeyLocked(NewMetaContextTODO(u.G()), arg)
 	if err != nil {
 		return nil, err
 	}
@@ -710,23 +719,6 @@ func (u *User) SigningKeyPub() (GenericKey, error) {
 		return nil, err
 	}
 	return pubKey, nil
-}
-
-func (u *User) TrackStatementJSON(them *User, outcome *IdentifyOutcome) (string, error) {
-	key, err := u.SigningKeyPub()
-	if err != nil {
-		return "", err
-	}
-
-	stmt, err := u.TrackingProofFor(key, them, outcome)
-	if err != nil {
-		return "", err
-	}
-	json, err := stmt.Marshal()
-	if err != nil {
-		return "", err
-	}
-	return string(json), nil
 }
 
 func (u *User) GetSigIDFromSeqno(seqno keybase1.Seqno) keybase1.SigID {
@@ -778,7 +770,7 @@ func (u *User) SigChainDump(w io.Writer) {
 	u.sigChain().Dump(w)
 }
 
-func (u *User) IsCachedIdentifyFresh(upk *keybase1.UserPlusKeys) bool {
+func (u *User) IsCachedIdentifyFresh(upk *keybase1.UserPlusKeysV2AllIncarnations) bool {
 	idv, _ := u.GetIDVersion()
 	if upk.Uvv.Id == 0 || idv != upk.Uvv.Id {
 		return false
@@ -829,3 +821,34 @@ func ValidateNormalizedUsername(username string) (NormalizedUsername, error) {
 	}
 	return res, nil
 }
+
+type UserForSignatures struct {
+	uid         keybase1.UID
+	name        NormalizedUsername
+	eldestKID   keybase1.KID
+	eldestSeqno keybase1.Seqno
+	latestPUK   *keybase1.PerUserKey
+}
+
+func (u UserForSignatures) GetUID() keybase1.UID                  { return u.uid }
+func (u UserForSignatures) GetName() string                       { return u.name.String() }
+func (u UserForSignatures) GetEldestKID() keybase1.KID            { return u.eldestKID }
+func (u UserForSignatures) GetNormalizedName() NormalizedUsername { return u.name }
+func (u UserForSignatures) ToUserVersion() keybase1.UserVersion {
+	return keybase1.UserVersion{Uid: u.uid, EldestSeqno: u.eldestSeqno}
+}
+func (u UserForSignatures) GetLatestPerUserKey() *keybase1.PerUserKey { return u.latestPUK }
+
+func (u *User) ToUserForSignatures() (ret UserForSignatures) {
+	if u == nil {
+		return ret
+	}
+	ret.uid = u.GetUID()
+	ret.name = u.GetNormalizedName()
+	ret.eldestKID = u.GetEldestKID()
+	ret.eldestSeqno = u.GetCurrentEldestSeqno()
+	ret.latestPUK = u.GetComputedKeyFamily().GetLatestPerUserKey()
+	return ret
+}
+
+var _ UserBasic = UserForSignatures{}

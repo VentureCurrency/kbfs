@@ -129,24 +129,69 @@ func (e *fsEngine) GetRootDir(user User, tlfName string, t tlf.Type, expectedCan
 	}
 	path := buildTlfPath(u, tlfName, t)
 	var realPath string
-	// TODO currently we pretend that Dokan has no symbolic links
-	// here and end up deferencing them. This works but is not
-	// ideal. (See Lookup.)
-	if preferredName == expectedPreferredName || e.name == "dokan" {
-		realPath = path
+	if e.name == "dokan" {
+		// TODO avoid trying to dereference symlinks for dokan. This
+		// works but is not ideal. (See Lookup.)
+		realPath = buildTlfPath(u, string(preferredName), t)
 	} else {
 		realPath, err = filepath.EvalSymlinks(path)
 		if err != nil {
 			return nil, err
 		}
-		realName := filepath.Base(realPath)
-		if realName != string(expectedPreferredName) {
-			return nil, fmt.Errorf(
-				"Expected preferred TLF name %s, got %s",
-				expectedPreferredName, realName)
+		if preferredName != expectedPreferredName {
+			realName := filepath.Base(realPath)
+			if realName != string(expectedPreferredName) {
+				return nil, fmt.Errorf(
+					"Expected preferred TLF name %s, got %s",
+					expectedPreferredName, realName)
+			}
 		}
 	}
 	return fsNode{realPath}, nil
+}
+
+// GetRootDirAtRevision implements the Engine interface.
+func (e *fsEngine) GetRootDirAtRevision(
+	u User, tlfName string, t tlf.Type, rev kbfsmd.Revision,
+	expectedCanonicalTlfName string) (dir Node, err error) {
+	d, err := e.GetRootDir(u, tlfName, t, expectedCanonicalTlfName)
+	if err != nil {
+		return nil, err
+	}
+	p := d.(fsNode)
+	revDir := libfs.ArchivedRevDirPrefix + rev.String()
+	return fsNode{filepath.Join(p.path, revDir)}, nil
+}
+
+// GetRootDirAtTimeString implements the Engine interface.
+func (e *fsEngine) GetRootDirAtTimeString(
+	u User, tlfName string, t tlf.Type, timeString string,
+	expectedCanonicalTlfName string) (dir Node, err error) {
+	d, err := e.GetRootDir(u, tlfName, t, expectedCanonicalTlfName)
+	if err != nil {
+		return nil, err
+	}
+	p := d.(fsNode)
+	timeLink := libfs.ArchivedTimeLinkPrefix + timeString
+	return fsNode{filepath.Join(p.path, timeLink)}, nil
+}
+
+// GetRootDirAtRelTimeString implements the Engine interface.
+func (e *fsEngine) GetRootDirAtRelTimeString(
+	u User, tlfName string, t tlf.Type, relTimeString string,
+	expectedCanonicalTlfName string) (dir Node, err error) {
+	d, err := e.GetRootDir(u, tlfName, t, expectedCanonicalTlfName)
+	if err != nil {
+		return nil, err
+	}
+	p := d.(fsNode)
+	fileName := libfs.ArchivedRelTimeFilePrefix + relTimeString
+	revDir, err := ioutil.ReadFile(filepath.Join(p.path, fileName))
+	if err != nil {
+		return nil, err
+	}
+
+	return fsNode{filepath.Join(p.path, string(revDir))}, nil
 }
 
 // CreateDir is called by the test harness to create a directory relative to the passed
@@ -405,6 +450,24 @@ func (*fsEngine) UnflushedPaths(user User, tlfName string, t tlf.Type) (
 	return bufStatus.Journal.UnflushedPaths, nil
 }
 
+// UserEditHistory implements the Engine interface.
+func (*fsEngine) UserEditHistory(user User) (
+	history []keybase1.FSFolderEditHistory, err error) {
+	u := user.(*fsUser)
+	buf, err := ioutil.ReadFile(
+		filepath.Join(u.mntDir, libfs.EditHistoryName))
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal(buf, &history)
+	if err != nil {
+		return nil, err
+	}
+
+	return history, nil
+}
+
 // DirtyPaths implements the Engine interface.
 func (*fsEngine) DirtyPaths(user User, tlfName string, t tlf.Type) (
 	[]string, error) {
@@ -531,6 +594,28 @@ func (*fsEngine) GetMtime(u User, file Node) (mtime time.Time, err error) {
 		return time.Time{}, err
 	}
 	return fi.ModTime(), err
+}
+
+type prevRevisions struct {
+	PrevRevisions libkbfs.PrevRevisions
+}
+
+// GetPrevRevisions implements the Engine interface.
+func (*fsEngine) GetPrevRevisions(u User, file Node) (
+	revs libkbfs.PrevRevisions, err error) {
+	n := file.(fsNode)
+	d, f := filepath.Split(n.path)
+	fullPath := filepath.Join(d, libfs.FileInfoPrefix+f)
+	buf, err := ioutil.ReadFile(fullPath)
+	if err != nil {
+		return nil, err
+	}
+	var pr prevRevisions
+	err = json.Unmarshal(buf, &pr)
+	if err != nil {
+		return nil, err
+	}
+	return pr.PrevRevisions, nil
 }
 
 // SyncAll implements the Engine interface.

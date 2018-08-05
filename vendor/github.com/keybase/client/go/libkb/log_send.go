@@ -4,8 +4,10 @@
 package libkb
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -19,18 +21,21 @@ import (
 	"time"
 
 	"github.com/keybase/client/go/logger"
+	"github.com/keybase/client/go/protocol/keybase1"
 )
 
 // Logs is the struct to specify the path of log files
 type Logs struct {
-	Desktop string
-	Kbfs    string
-	Service string
-	Updater string
-	Start   string
-	Install string
-	System  string
-	Git     string
+	Desktop  string
+	Kbfs     string
+	Service  string
+	Updater  string
+	Start    string
+	Install  string
+	System   string
+	Git      string
+	Trace    string
+	Watchdog string
 }
 
 // LogSendContext for LogSend
@@ -39,7 +44,20 @@ type LogSendContext struct {
 	Logs Logs
 }
 
-func addFile(mpart *multipart.Writer, param, filename, data string) error {
+func addFile(mpart *multipart.Writer, param, filename string, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+
+	part, err := mpart.CreateFormFile(param, filename)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(part, bytes.NewBuffer(data))
+	return err
+}
+
+func addGzippedFile(mpart *multipart.Writer, param, filename, data string) error {
 	if len(data) == 0 {
 		return nil
 	}
@@ -55,7 +73,7 @@ func addFile(mpart *multipart.Writer, param, filename, data string) error {
 	return gz.Close()
 }
 
-func (l *LogSendContext) post(status, feedback, kbfsLog, svcLog, desktopLog, updaterLog, startLog, installLog, systemLog, gitLog string) (string, error) {
+func (l *LogSendContext) post(status, feedback, kbfsLog, svcLog, desktopLog, updaterLog, startLog, installLog, systemLog, gitLog, watchdogLog string, traceBundle []byte, uid keybase1.UID, installID InstallID) (string, error) {
 	l.G().Log.Debug("sending status + logs to keybase")
 
 	var body bytes.Buffer
@@ -65,47 +83,62 @@ func (l *LogSendContext) post(status, feedback, kbfsLog, svcLog, desktopLog, upd
 		mpart.WriteField("feedback", feedback)
 	}
 
-	if err := addFile(mpart, "status_gz", "status.gz", status); err != nil {
+	if len(installID) > 0 {
+		mpart.WriteField("install_id", string(installID))
+	}
+
+	if !uid.IsNil() {
+		mpart.WriteField("uid", uid.String())
+	}
+
+	if err := addGzippedFile(mpart, "status_gz", "status.gz", status); err != nil {
 		return "", err
 	}
-	if err := addFile(mpart, "kbfs_log_gz", "kbfs_log.gz", kbfsLog); err != nil {
+	if err := addGzippedFile(mpart, "kbfs_log_gz", "kbfs_log.gz", kbfsLog); err != nil {
 		return "", err
 	}
-	if err := addFile(mpart, "keybase_log_gz", "keybase_log.gz", svcLog); err != nil {
+	if err := addGzippedFile(mpart, "keybase_log_gz", "keybase_log.gz", svcLog); err != nil {
 		return "", err
 	}
-	if err := addFile(mpart, "updater_log_gz", "updater_log.gz", updaterLog); err != nil {
+	if err := addGzippedFile(mpart, "updater_log_gz", "updater_log.gz", updaterLog); err != nil {
 		return "", err
 	}
-	if err := addFile(mpart, "gui_log_gz", "gui_log.gz", desktopLog); err != nil {
+	if err := addGzippedFile(mpart, "gui_log_gz", "gui_log.gz", desktopLog); err != nil {
 		return "", err
 	}
-	if err := addFile(mpart, "start_log_gz", "start_log.gz", startLog); err != nil {
+	if err := addGzippedFile(mpart, "start_log_gz", "start_log.gz", startLog); err != nil {
 		return "", err
 	}
-	if err := addFile(mpart, "install_log_gz", "install_log.gz", installLog); err != nil {
+	if err := addGzippedFile(mpart, "install_log_gz", "install_log.gz", installLog); err != nil {
 		return "", err
 	}
-	if err := addFile(mpart, "system_log_gz", "system_log.gz", systemLog); err != nil {
+	if err := addGzippedFile(mpart, "system_log_gz", "system_log.gz", systemLog); err != nil {
 		return "", err
 	}
-	if err := addFile(mpart, "git_log_gz", "git_log.gz", gitLog); err != nil {
+	if err := addGzippedFile(mpart, "git_log_gz", "git_log.gz", gitLog); err != nil {
 		return "", err
+	}
+	if err := addGzippedFile(mpart, "watchdog_log_gz", "watchdog_log.gz", watchdogLog); err != nil {
+		return "", err
+	}
+
+	if len(traceBundle) > 0 {
+		l.G().Log.Debug("trace bundle size: %d", len(traceBundle))
+		if err := addFile(mpart, "trace_tar_gz", "trace.tar.gz", traceBundle); err != nil {
+			return "", err
+		}
 	}
 
 	if err := mpart.Close(); err != nil {
 		return "", err
 	}
 
-	l.G().Log.Debug("body size: %d\n", body.Len())
+	l.G().Log.Debug("body size: %d", body.Len())
 
 	arg := APIArg{
 		Endpoint:    "logdump/send",
 		SessionType: APISessionTypeOPTIONAL,
 	}
-
-	// Get the login session, if any
-	l.G().LoginState().LoggedInLoad()
 
 	resp, err := l.G().API.PostRaw(arg, mpart.FormDataContentType(), &body)
 	if err != nil {
@@ -354,8 +387,73 @@ func tailFile(log logger.Logger, which string, filename string, numBytes int) (r
 	return string(buf), seeked
 }
 
-// LogSend sends the the tails of log files to kb
-func (l *LogSendContext) LogSend(statusJSON, feedback string, sendLogs bool, numBytes int) (string, error) {
+func addFileToTar(tw *tar.Writer, path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if stat, err := file.Stat(); err == nil {
+		header := tar.Header{
+			Typeflag: tar.TypeReg,
+			Name:     filepath.Base(path),
+			Size:     stat.Size(),
+			Mode:     int64(0600),
+			ModTime:  stat.ModTime(),
+		}
+		if err := tw.WriteHeader(&header); err != nil {
+			return err
+		}
+		if _, err := io.Copy(tw, file); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addFilesToTarGz(log logger.Logger, w io.Writer, paths []string) bool {
+	gw := gzip.NewWriter(w)
+	defer gw.Close()
+	tw := tar.NewWriter(gw)
+	defer tw.Close()
+
+	added := false
+	for _, path := range paths {
+		err := addFileToTar(tw, path)
+		if err != nil {
+			log.Warning("Error adding %q to tar file: %s", path, err)
+			continue
+		}
+		log.Debug("Added trace file %q", path)
+		added = true
+	}
+	return added
+}
+
+func getTraceBundle(log logger.Logger, traceDir string) []byte {
+	traceFiles, err := GetSortedTraceFiles(traceDir)
+	if err != nil {
+		log.Warning("Error getting trace files in %q: %s", traceDir, err)
+		return nil
+	}
+
+	// Send the newest trace files.
+	if len(traceFiles) > MaxTraceFileCount {
+		traceFiles = traceFiles[len(traceFiles)-MaxTraceFileCount:]
+	}
+
+	buf := bytes.NewBuffer(nil)
+	added := addFilesToTarGz(log, buf, traceFiles)
+	if !added {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+// LogSend sends the tails of log files to kb, and also the last
+// few trace output files.
+func (l *LogSendContext) LogSend(statusJSON, feedback string, sendLogs bool, numBytes int, uid keybase1.UID, installID InstallID, mergeExtendedStatus bool) (string, error) {
 	logs := l.Logs
 	var kbfsLog string
 	var svcLog string
@@ -365,6 +463,8 @@ func (l *LogSendContext) LogSend(statusJSON, feedback string, sendLogs bool, num
 	var installLog string
 	var systemLog string
 	var gitLog string
+	var traceBundle []byte
+	var watchdogLog string
 
 	if sendLogs {
 		svcLog = tail(l.G().Log, "service", logs.Service, numBytes)
@@ -383,6 +483,14 @@ func (l *LogSendContext) LogSend(statusJSON, feedback string, sendLogs bool, num
 		installLog = tail(l.G().Log, "install", logs.Install, numBytes)
 		systemLog = tail(l.G().Log, "system", logs.System, numBytes)
 		gitLog = tail(l.G().Log, "git", logs.Git, numBytes)
+		watchdogLog = tail(l.G().Log, "watchdog", logs.Watchdog, numBytes)
+		if logs.Trace != "" {
+			traceBundle = getTraceBundle(l.G().Log, logs.Trace)
+		}
+		// Only add extended status if we're sending logs
+		if mergeExtendedStatus {
+			statusJSON = l.mergeExtendedStatus(statusJSON)
+		}
 	} else {
 		kbfsLog = ""
 		svcLog = ""
@@ -392,7 +500,32 @@ func (l *LogSendContext) LogSend(statusJSON, feedback string, sendLogs bool, num
 		installLog = ""
 		systemLog = ""
 		gitLog = ""
+		watchdogLog = ""
 	}
 
-	return l.post(statusJSON, feedback, kbfsLog, svcLog, desktopLog, updaterLog, startLog, installLog, systemLog, gitLog)
+	return l.post(statusJSON, feedback, kbfsLog, svcLog, desktopLog, updaterLog, startLog, installLog, systemLog, gitLog, watchdogLog, traceBundle, uid, installID)
+}
+
+// mergeExtendedStatus adds the extended status to the given status json blob.
+// If any errors occur the original status is returned unmodified.
+func (l *LogSendContext) mergeExtendedStatus(status string) string {
+	var statusObj map[string]interface{}
+	if err := json.Unmarshal([]byte(status), &statusObj); err != nil {
+		return status
+	}
+
+	extStatus, err := GetExtendedStatus(NewMetaContextTODO(l.G()))
+	if err != nil {
+		return status
+	}
+
+	statusMap := make(map[string]interface{})
+	statusMap["status"] = statusObj
+	statusMap["extstatus"] = extStatus
+
+	fullStatus, err := json.Marshal(statusMap)
+	if err != nil {
+		return status
+	}
+	return string(fullStatus)
 }

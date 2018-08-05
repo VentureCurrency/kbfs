@@ -5,18 +5,19 @@
 package libkbfs
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/keybase/backoff"
+	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/logger"
 	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/kbfs/kbfsblock"
 	"github.com/keybase/kbfs/kbfsmd"
 	"github.com/keybase/kbfs/kbfssync"
 	"github.com/keybase/kbfs/tlf"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -66,6 +67,7 @@ type blocksToDelete struct {
 // particular TLF.  It archives historical blocks and reclaims quota
 // usage, all in the background.
 type folderBlockManager struct {
+	g            *libkb.GlobalContext
 	config       Config
 	log          logger.Logger
 	shutdownChan chan struct{}
@@ -117,11 +119,13 @@ type folderBlockManager struct {
 	lastReclamationTime time.Time
 }
 
-func newFolderBlockManager(config Config, fb FolderBranch,
+func newFolderBlockManager(
+	g *libkb.GlobalContext, config Config, fb FolderBranch, bType branchType,
 	helper fbmHelper) *folderBlockManager {
 	tlfStringFull := fb.Tlf.String()
 	log := config.MakeLogger(fmt.Sprintf("FBM %s", tlfStringFull[:8]))
 	fbm := &folderBlockManager{
+		g:            g,
 		config:       config,
 		log:          log,
 		shutdownChan: make(chan struct{}),
@@ -138,17 +142,13 @@ func newFolderBlockManager(config Config, fb FolderBranch,
 	// doesn't do possibly-racy-in-tests access to
 	// fbm.config.BlockOps().
 
-	if config.Mode() == InitMinimal {
-		// If this device is in minimal mode and won't be doing any
-		// data writes, no need deal with block-level cleanup
-		// operations.  TODO: in the future it might still be useful
-		// to have e.g. mobile devices doing QR.
+	if bType != standard || !config.Mode().BlockManagementEnabled() {
 		return fbm
 	}
 
 	go fbm.archiveBlocksInBackground()
 	go fbm.deleteBlocksInBackground()
-	if fb.Branch == MasterBranch && config.Mode() != InitSingleOp {
+	if fb.Branch == MasterBranch && config.Mode().QuotaReclamationEnabled() {
 		go fbm.reclaimQuotaInBackground()
 	}
 	return fbm
@@ -500,6 +500,15 @@ func (fbm *folderBlockManager) processBlocksToDelete(ctx context.Context, toDele
 
 	defer fbm.blocksToDeleteWaitGroup.Done()
 
+	// Make sure all blocks in the journal (if journaling is enabled)
+	// are flushed before attempting to delete any of them.
+	if jServer, err := GetJournalServer(fbm.config); err == nil {
+		fbm.log.CDebugf(ctx, "Waiting for journal to flush")
+		if err := jServer.WaitForCompleteFlush(ctx, fbm.id); err != nil {
+			return err
+		}
+	}
+
 	fbm.log.CDebugf(ctx, "Checking deleted blocks for revision %d",
 		toDelete.md.Revision())
 	// Make sure that the MD didn't actually become part of the folder
@@ -730,7 +739,7 @@ func (fbm *folderBlockManager) deleteBlocksInBackground() {
 func (fbm *folderBlockManager) isOldEnough(rmd ImmutableRootMetadata) bool {
 	// Trust the server's timestamp on this MD.
 	mtime := rmd.localTimestamp
-	unrefAge := fbm.config.QuotaReclamationMinUnrefAge()
+	unrefAge := fbm.config.Mode().QuotaReclamationMinUnrefAge()
 	return mtime.Add(unrefAge).Before(fbm.config.Clock().Now())
 }
 
@@ -774,7 +783,7 @@ func (fbm *folderBlockManager) getMostRecentOldEnoughAndGCRevisions(
 				fbm.isOldEnough(rmd) {
 				fbm.log.CDebugf(ctx, "Revision %d is older than the unref "+
 					"age %s", rmd.Revision(),
-					fbm.config.QuotaReclamationMinUnrefAge())
+					fbm.config.Mode().QuotaReclamationMinUnrefAge())
 				mostRecentOldEnoughRev = rmd.Revision()
 			}
 
@@ -992,8 +1001,12 @@ func (fbm *folderBlockManager) isQRNecessary(
 	// written by this device.  We want to avoid fighting with other
 	// active writers whenever possible.
 	if !selfWroteHead {
+		minHeadAge := fbm.config.Mode().QuotaReclamationMinHeadAge()
+		if minHeadAge <= 0 {
+			return false
+		}
 		headAge := fbm.config.Clock().Now().Sub(head.localTimestamp)
-		if headAge < fbm.config.QuotaReclamationMinHeadAge() {
+		if headAge < minHeadAge {
 			return false
 		}
 	}
@@ -1024,7 +1037,8 @@ func (fbm *folderBlockManager) doReclamation(timer *time.Timer) (err error) {
 	ctx, cancel := context.WithCancel(fbm.ctxWithFBMID(context.Background()))
 	fbm.setReclamationCancel(cancel)
 	defer fbm.cancelReclamation()
-	defer timer.Reset(fbm.config.QuotaReclamationPeriod())
+	nextPeriod := fbm.config.Mode().QuotaReclamationPeriod()
+	defer timer.Reset(nextPeriod)
 	defer fbm.reclamationGroup.Done()
 
 	// Don't set a context deadline.  For users that have written a
@@ -1081,6 +1095,11 @@ func (fbm *folderBlockManager) doReclamation(timer *time.Timer) (err error) {
 		}
 		if !reclamationTime.IsZero() {
 			fbm.lastReclamationTime = reclamationTime
+		}
+		if !complete {
+			// If there's more data to reclaim, only wait a short
+			// while before the next QR attempt.
+			nextPeriod = 1 * time.Minute
 		}
 	}()
 
@@ -1155,33 +1174,67 @@ func (fbm *folderBlockManager) doReclamation(timer *time.Timer) (err error) {
 	return fbm.finalizeReclamation(ctx, ptrs, zeroRefCounts, latestRev)
 }
 
+func isPermanentQRError(err error) bool {
+	switch errors.Cause(err).(type) {
+	case WriteAccessError, kbfsmd.MetadataIsFinalError,
+		RevokedDeviceVerificationError:
+		return true
+	default:
+		return false
+	}
+}
+
 func (fbm *folderBlockManager) reclaimQuotaInBackground() {
-	timer := time.NewTimer(fbm.config.QuotaReclamationPeriod())
+	autoQR := true
+	timer := time.NewTimer(fbm.config.Mode().QuotaReclamationPeriod())
+
+	if fbm.config.Mode().QuotaReclamationPeriod().Seconds() != 0 {
+		// Run QR once immediately at the start of the period.
+		fbm.reclamationGroup.Add(1)
+		err := fbm.doReclamation(timer)
+		if isPermanentQRError(err) {
+			autoQR = false
+			fbm.log.CDebugf(context.Background(),
+				"Permanently stopping QR due to initial error: %+v", err)
+		}
+	}
+
 	timerChan := timer.C
 	for {
 		// Don't let the timer fire if auto-reclamation is turned off.
-		if fbm.config.QuotaReclamationPeriod().Seconds() == 0 {
+		if !autoQR ||
+			fbm.config.Mode().QuotaReclamationPeriod().Seconds() == 0 {
 			timer.Stop()
 			// Use a channel that will never fire instead.
 			timerChan = make(chan time.Time)
 		}
+
+		state := keybase1.AppState_FOREGROUND
 		select {
 		case <-fbm.shutdownChan:
 			return
+		case state = <-fbm.g.AppState.NextUpdate(&state):
+			for state != keybase1.AppState_FOREGROUND {
+				fbm.log.CDebugf(context.Background(),
+					"Pausing QR while not foregrounded: state=%s", state)
+				state = <-fbm.g.AppState.NextUpdate(&state)
+			}
+			fbm.log.CDebugf(
+				context.Background(), "Resuming QR while foregrounded")
+			continue
 		case <-timerChan:
 			fbm.reclamationGroup.Add(1)
 		case <-fbm.forceReclamationChan:
 		}
 
 		err := fbm.doReclamation(timer)
-		_, isWriteError := err.(WriteAccessError)
-		_, isFinalError := err.(kbfsmd.MetadataIsFinalError)
-		if isWriteError || isFinalError {
+		if isPermanentQRError(err) {
 			// If we can't write the MD, don't bother with the timer
 			// anymore. Don't completely shut down, since we don't
 			// want forced reclamations to hang.
 			timer.Stop()
 			timerChan = make(chan time.Time)
+			autoQR = false
 			fbm.log.CDebugf(context.Background(),
 				"Permanently stopping QR due to error: %+v", err)
 		}

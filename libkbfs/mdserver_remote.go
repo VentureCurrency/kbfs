@@ -121,7 +121,7 @@ func NewMDServerRemote(config Config, srvRemote rpc.Remote,
 	// Check for rekey opportunities periodically.
 	rekeyCtx, rekeyCancel := context.WithCancel(context.Background())
 	mdServer.rekeyCancel = rekeyCancel
-	if config.Mode() != InitSingleOp {
+	if config.Mode().RekeyWorkers() > 0 {
 		go mdServer.backgroundRekeyChecker(rekeyCtx)
 	}
 
@@ -280,7 +280,7 @@ func (md *MDServerRemote) resetAuth(
 	isAuthenticated = true
 
 	md.authenticatedMtx.Lock()
-	if !md.isAuthenticated && md.config.Mode() != InitSingleOp {
+	if !md.isAuthenticated && md.config.Mode().RekeyWorkers() > 0 {
 		defer func() {
 			// request a list of folders needing rekey action
 			if err := md.getFoldersForRekey(ctx, c); err != nil {
@@ -592,6 +592,38 @@ func (md *MDServerRemote) GetForTLF(ctx context.Context, id tlf.ID,
 	}
 	// TODO: Error if server returns more than one rmds.
 	return rmdses[0], nil
+}
+
+// GetForTLFByTime implements the MDServer interface for MDServerRemote.
+func (md *MDServerRemote) GetForTLFByTime(
+	ctx context.Context, id tlf.ID, serverTime time.Time) (
+	rmds *RootMetadataSigned, err error) {
+	ctx = rpc.WithFireNow(ctx)
+	md.log.LazyTrace(ctx, "MDServer: GetForTLFByTime %s %s", id, serverTime)
+	defer func() {
+		md.deferLog.LazyTrace(
+			ctx, "MDServer: GetForTLFByTime %s %s done (err=%v)",
+			id, serverTime, err)
+	}()
+
+	arg := keybase1.GetMetadataByTimestampArg{
+		FolderID:   id.String(),
+		ServerTime: keybase1.ToTime(serverTime),
+	}
+
+	block, err := md.getClient().GetMetadataByTimestamp(ctx, arg)
+	if err != nil {
+		return nil, err
+	}
+
+	ver, max := kbfsmd.MetadataVer(block.Version), md.config.MetadataVersion()
+	rmds, err = DecodeRootMetadataSigned(
+		md.config.Codec(), id, ver, max, block.Block,
+		keybase1.FromTime(block.Timestamp))
+	if err != nil {
+		return nil, err
+	}
+	return rmds, nil
 }
 
 // GetRange implements the MDServer interface for MDServerRemote.
@@ -942,7 +974,7 @@ func (md *MDServerRemote) CheckForRekeys(ctx context.Context) <-chan error {
 	// is using the same value.  TODO: the server should tell us what
 	// value it is using.
 	c := make(chan error, 1)
-	if md.config.Mode() == InitSingleOp {
+	if md.config.Mode().RekeyWorkers() == 0 {
 		c <- nil
 		return c
 	}
@@ -1232,6 +1264,99 @@ func (md *MDServerRemote) FastForwardBackoff() {
 	md.connMu.RLock()
 	defer md.connMu.RUnlock()
 	md.conn.FastForwardInitialBackoffTimer()
+}
+
+// FindNextMD implements the MDServer interface for MDServerRemote.
+func (md *MDServerRemote) FindNextMD(
+	ctx context.Context, tlfID tlf.ID, rootSeqno keybase1.Seqno) (
+	nextKbfsRoot *kbfsmd.MerkleRoot, nextMerkleNodes [][]byte,
+	nextRootSeqno keybase1.Seqno, err error) {
+	ctx = rpc.WithFireNow(ctx)
+	md.log.LazyTrace(ctx, "KeyServer: FindNextMD %s %d", tlfID, rootSeqno)
+	md.log.CDebugf(ctx, "KeyServer: FindNextMD %s %d", tlfID, rootSeqno)
+	defer func() {
+		md.deferLog.LazyTrace(ctx, "KeyServer: FindNextMD %s %d done (err=%v)",
+			tlfID, rootSeqno, err)
+		md.deferLog.CDebugf(ctx, "KeyServer: FindNextMD %s %d done (err=%v)",
+			tlfID, rootSeqno, err)
+	}()
+
+	arg := keybase1.FindNextMDArg{
+		FolderID: tlfID.String(),
+		Seqno:    rootSeqno,
+	}
+
+	response, err := md.getClient().FindNextMD(ctx, arg)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	if len(response.MerkleNodes) == 0 {
+		md.log.CDebugf(ctx, "No merkle data found for %s, seqno=%d",
+			tlfID, rootSeqno)
+		return nil, nil, 0, nil
+	}
+
+	if response.KbfsRoot.Version != 1 {
+		return nil, nil, 0,
+			kbfsmd.NewMerkleVersionError{Version: response.KbfsRoot.Version}
+	}
+
+	// Verify this is a valid merkle root and KBFS root before we
+	// decode the bytes.
+	md.log.CDebugf(ctx, "Verifying merkle root %d", response.RootSeqno)
+	root := keybase1.MerkleRootV2{
+		Seqno:    response.RootSeqno,
+		HashMeta: response.RootHash,
+	}
+	expectedKbfsRoot := keybase1.KBFSRoot{
+		TreeID: tlfToMerkleTreeID(tlfID),
+		Root:   response.KbfsRoot.Root,
+	}
+	err = md.config.KBPKI().VerifyMerkleRoot(ctx, root, expectedKbfsRoot)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	var kbfsRoot kbfsmd.MerkleRoot
+	err = md.config.Codec().Decode(response.KbfsRoot.Root, &kbfsRoot)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	return &kbfsRoot, response.MerkleNodes, response.RootSeqno, nil
+}
+
+// GetMerkleRootLatest implements the MDServer interface for MDServerRemote.
+func (md *MDServerRemote) GetMerkleRootLatest(
+	ctx context.Context, treeID keybase1.MerkleTreeID) (
+	root *kbfsmd.MerkleRoot, err error) {
+	ctx = rpc.WithFireNow(ctx)
+	md.log.LazyTrace(ctx, "KeyServer: GetMerkleRootLatest %d", treeID)
+	md.log.CDebugf(ctx, "KeyServer: GetMerkleRootLatest %d", treeID)
+	defer func() {
+		md.deferLog.LazyTrace(ctx,
+			"KeyServer: GetMerkleRootLatest %d done (err=%v)", treeID, err)
+		md.deferLog.CDebugf(ctx,
+			"KeyServer: GetMerkleRootLatest %d done (err=%v)", treeID, err)
+	}()
+
+	res, err := md.getClient().GetMerkleRootLatest(ctx, treeID)
+	if err != nil {
+		return nil, err
+	}
+
+	if res.Version != 1 {
+		return nil, kbfsmd.NewMerkleVersionError{Version: res.Version}
+	}
+
+	var kbfsRoot kbfsmd.MerkleRoot
+	err = md.config.Codec().Decode(res.Root, &kbfsRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	return &kbfsRoot, nil
 }
 
 func (md *MDServerRemote) resetRekeyTimer() {

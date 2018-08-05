@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/keybase/client/go/libkb"
+	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/kbfs/kbfsmd"
 	"github.com/keybase/kbfs/libfs"
 	"github.com/keybase/kbfs/libkbfs"
@@ -40,6 +41,9 @@ type opt struct {
 	tlfName                  string
 	expectedCanonicalTlfName string
 	tlfType                  tlf.Type
+	tlfRevision              kbfsmd.Revision
+	tlfTime                  string
+	tlfRelTime               string
 	users                    map[libkb.NormalizedUsername]User
 	stallers                 map[libkb.NormalizedUsername]*libkbfs.NaïveStaller
 	tb                       testing.TB
@@ -170,7 +174,7 @@ func (o *opt) close() {
 func (o *opt) runInitOnce() {
 	o.initOnce.Do(func() {
 		o.clock = &libkbfs.TestClock{}
-		o.clock.Set(time.Unix(0, 0))
+		o.clock.Set(time.Unix(1, 0))
 		o.users = o.engine.InitTest(o.ver, o.blockSize,
 			o.blockChangeSize, o.batchSize, o.bwKBps, o.timeout, o.usernames,
 			o.teams, o.implicitTeams, o.clock, o.journal)
@@ -316,6 +320,33 @@ func inPrivateTlf(name string) optionOp {
 		o.tlfName = name
 		o.expectedCanonicalTlfName = name
 		o.tlfType = tlf.Private
+	}
+}
+
+func inPrivateTlfAtRevision(name string, rev kbfsmd.Revision) optionOp {
+	return func(o *opt) {
+		o.tlfName = name
+		o.expectedCanonicalTlfName = name
+		o.tlfType = tlf.Private
+		o.tlfRevision = rev
+	}
+}
+
+func inPrivateTlfAtTime(name string, timeString string) optionOp {
+	return func(o *opt) {
+		o.tlfName = name
+		o.expectedCanonicalTlfName = name
+		o.tlfType = tlf.Private
+		o.tlfTime = timeString
+	}
+}
+
+func inPrivateTlfAtRelativeTime(name string, relTimeString string) optionOp {
+	return func(o *opt) {
+		o.tlfName = name
+		o.expectedCanonicalTlfName = name
+		o.tlfType = tlf.Private
+		o.tlfRelTime = relTimeString
 	}
 }
 
@@ -506,7 +537,24 @@ func initRoot() fileOp {
 				return err
 			}
 		}
-		root, err := c.engine.GetRootDir(c.user, c.tlfName, c.tlfType, c.expectedCanonicalTlfName)
+		var root Node
+		var err error
+		if c.tlfRevision != kbfsmd.RevisionUninitialized {
+			root, err = c.engine.GetRootDirAtRevision(
+				c.user, c.tlfName, c.tlfType, c.tlfRevision,
+				c.expectedCanonicalTlfName)
+		} else if c.tlfTime != "" {
+			root, err = c.engine.GetRootDirAtTimeString(
+				c.user, c.tlfName, c.tlfType, c.tlfTime,
+				c.expectedCanonicalTlfName)
+		} else if c.tlfRelTime != "" {
+			root, err = c.engine.GetRootDirAtRelTimeString(
+				c.user, c.tlfName, c.tlfType, c.tlfRelTime,
+				c.expectedCanonicalTlfName)
+		} else {
+			root, err = c.engine.GetRootDir(
+				c.user, c.tlfName, c.tlfType, c.expectedCanonicalTlfName)
+		}
 		if err != nil {
 			return err
 		}
@@ -658,6 +706,11 @@ func setmtime(filepath string, mtime time.Time) fileOp {
 
 func mtime(filepath string, expectedMtime time.Time) fileOp {
 	return fileOp{func(c *ctx) error {
+		// If the expected time is zero, use the clock's current time.
+		if expectedMtime.IsZero() {
+			expectedMtime = c.clock.Now()
+		}
+
 		file, _, err := c.getNode(filepath, noCreate, dontResolveFinalSym)
 		if err != nil {
 			return err
@@ -944,6 +997,65 @@ func checkUnflushedPaths(expectedPaths []string) fileOp {
 	}, IsInit, fmt.Sprintf("checkUnflushedPaths(%s)", expectedPaths)}
 }
 
+func checkPrevRevisions(filepath string, counts []uint8) fileOp {
+	return fileOp{func(c *ctx) error {
+		file, _, err := c.getNode(filepath, noCreate, resolveAllSyms)
+		if err != nil {
+			return err
+		}
+		pr, err := c.engine.GetPrevRevisions(c.user, file)
+		if err != nil {
+			return err
+		}
+		if len(pr) != len(counts) {
+			return fmt.Errorf("Wrong number of prev revisions: %v", pr)
+		}
+		for i, c := range counts {
+			if c != pr[i].Count {
+				return fmt.Errorf("Unexpected prev revision counts: %v", pr)
+			}
+		}
+		return nil
+	}, Defaults, fmt.Sprintf("prevRevisions(%s, %v)", filepath, counts)}
+}
+
+type expectedEdit struct {
+	tlfName string
+	tlfType keybase1.FolderType
+	writer  string
+	files   []string
+}
+
+func checkUserEditHistory(expectedEdits []expectedEdit) fileOp {
+	return fileOp{func(c *ctx) error {
+		history, err := c.engine.UserEditHistory(c.user)
+		if err != nil {
+			return err
+		}
+
+		// Convert the history to expected edits.
+		hEdits := make([]expectedEdit, len(history))
+		for i, h := range history {
+			if len(h.History) != 1 {
+				return fmt.Errorf(
+					"Unexpected history of size %d: %#v", len(h.History), h)
+			}
+			hEdits[i].tlfName = h.Folder.Name
+			hEdits[i].tlfType = h.Folder.FolderType
+			hEdits[i].writer = h.History[0].WriterName
+			for _, we := range h.History[0].Edits {
+				hEdits[i].files = append(hEdits[i].files, we.Filename)
+			}
+		}
+
+		if !reflect.DeepEqual(expectedEdits, hEdits) {
+			return fmt.Errorf("Expected edit history %v, got %v",
+				expectedEdits, hEdits)
+		}
+		return nil
+	}, Defaults, "checkUserEditHistory()"}
+}
+
 func checkDirtyPaths(expectedPaths []string) fileOp {
 	return fileOp{func(c *ctx) error {
 		paths, err := c.engine.DirtyPaths(c.user, c.tlfName, c.tlfType)
@@ -1147,7 +1259,7 @@ func (c *ctx) getNode(filepath string, create createType, sym symBehavior) (
 // duration past the default time.
 func crnameAtTime(path string, user username, d time.Duration) string {
 	cre := libkbfs.WriterDeviceDateConflictRenamer{}
-	return cre.ConflictRenameHelper(time.Unix(0, 0).Add(d), string(user),
+	return cre.ConflictRenameHelper(time.Unix(1, 0).Add(d), string(user),
 		"dev1", path)
 }
 

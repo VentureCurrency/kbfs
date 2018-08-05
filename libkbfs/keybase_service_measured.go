@@ -5,8 +5,11 @@
 package libkbfs
 
 import (
+	"time"
+
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/protocol/keybase1"
+	"github.com/keybase/kbfs/kbfscrypto"
 	"github.com/keybase/kbfs/kbfsmd"
 	"github.com/keybase/kbfs/tlf"
 	metrics "github.com/rcrowley/go-metrics"
@@ -23,15 +26,16 @@ type KeybaseServiceMeasured struct {
 	resolveImplicitTeamByIDTimer     metrics.Timer
 	loadUserPlusKeysTimer            metrics.Timer
 	loadTeamPlusKeysTimer            metrics.Timer
-	loadUnverifiedKeysTimer          metrics.Timer
 	createTeamTLFTimer               metrics.Timer
 	getTeamSettingsTimer             metrics.Timer
 	getCurrentMerkleRootTimer        metrics.Timer
+	verifyMerkleRootTimer            metrics.Timer
 	currentSessionTimer              metrics.Timer
 	favoriteAddTimer                 metrics.Timer
 	favoriteDeleteTimer              metrics.Timer
 	favoriteListTimer                metrics.Timer
 	notifyTimer                      metrics.Timer
+	notifyPathUpdatedTimer           metrics.Timer
 	putGitMetadataTimer              metrics.Timer
 }
 
@@ -48,15 +52,16 @@ func NewKeybaseServiceMeasured(delegate KeybaseService, r metrics.Registry) Keyb
 		"KeybaseService.ResolveImplicitTeamByID", r)
 	loadUserPlusKeysTimer := metrics.GetOrRegisterTimer("KeybaseService.LoadUserPlusKeys", r)
 	loadTeamPlusKeysTimer := metrics.GetOrRegisterTimer("KeybaseService.LoadTeamPlusKeys", r)
-	loadUnverifiedKeysTimer := metrics.GetOrRegisterTimer("KeybaseService.LoadUnverifiedKeys", r)
 	createTeamTLFTimer := metrics.GetOrRegisterTimer("KeybaseService.CreateTeamTLF", r)
 	getTeamSettingsTimer := metrics.GetOrRegisterTimer("KeybaseService.GetTeamSettings", r)
 	getCurrentMerkleRootTimer := metrics.GetOrRegisterTimer("KeybaseService.GetCurrentMerkleRoot", r)
+	verifyMerkleRootTimer := metrics.GetOrRegisterTimer("KeybaseService.VerifyMerkleRoot", r)
 	currentSessionTimer := metrics.GetOrRegisterTimer("KeybaseService.CurrentSession", r)
 	favoriteAddTimer := metrics.GetOrRegisterTimer("KeybaseService.FavoriteAdd", r)
 	favoriteDeleteTimer := metrics.GetOrRegisterTimer("KeybaseService.FavoriteDelete", r)
 	favoriteListTimer := metrics.GetOrRegisterTimer("KeybaseService.FavoriteList", r)
 	notifyTimer := metrics.GetOrRegisterTimer("KeybaseService.Notify", r)
+	notifyPathUpdatedTimer := metrics.GetOrRegisterTimer("KeybaseService.NotifyPathUpdated", r)
 	putGitMetadataTimer := metrics.GetOrRegisterTimer(
 		"KeybaseService.PutGitMetadata", r)
 	return KeybaseServiceMeasured{
@@ -67,15 +72,16 @@ func NewKeybaseServiceMeasured(delegate KeybaseService, r metrics.Registry) Keyb
 		resolveImplicitTeamByIDTimer:     resolveImplicitTeamByIDTimer,
 		loadUserPlusKeysTimer:            loadUserPlusKeysTimer,
 		loadTeamPlusKeysTimer:            loadTeamPlusKeysTimer,
-		loadUnverifiedKeysTimer:          loadUnverifiedKeysTimer,
 		createTeamTLFTimer:               createTeamTLFTimer,
 		getTeamSettingsTimer:             getTeamSettingsTimer,
 		getCurrentMerkleRootTimer:        getCurrentMerkleRootTimer,
+		verifyMerkleRootTimer:            verifyMerkleRootTimer,
 		currentSessionTimer:              currentSessionTimer,
 		favoriteAddTimer:                 favoriteAddTimer,
 		favoriteDeleteTimer:              favoriteDeleteTimer,
 		favoriteListTimer:                favoriteListTimer,
 		notifyTimer:                      notifyTimer,
+		notifyPathUpdatedTimer:           notifyPathUpdatedTimer,
 		putGitMetadataTimer:              putGitMetadataTimer,
 	}
 }
@@ -131,11 +137,13 @@ func (k KeybaseServiceMeasured) LoadUserPlusKeys(ctx context.Context,
 
 // LoadTeamPlusKeys implements the KeybaseService interface for KeybaseServiceMeasured.
 func (k KeybaseServiceMeasured) LoadTeamPlusKeys(ctx context.Context,
-	tid keybase1.TeamID, desiredKeyGen kbfsmd.KeyGen, desiredUser keybase1.UserVersion,
+	tid keybase1.TeamID, tlfType tlf.Type, desiredKeyGen kbfsmd.KeyGen,
+	desiredUser keybase1.UserVersion, desiredKey kbfscrypto.VerifyingKey,
 	desiredRole keybase1.TeamRole) (teamInfo TeamInfo, err error) {
 	k.loadTeamPlusKeysTimer.Time(func() {
 		teamInfo, err = k.delegate.LoadTeamPlusKeys(
-			ctx, tid, desiredKeyGen, desiredUser, desiredRole)
+			ctx, tid, tlfType, desiredKeyGen, desiredUser, desiredKey,
+			desiredRole)
 	})
 	return teamInfo, err
 }
@@ -164,20 +172,22 @@ func (k KeybaseServiceMeasured) GetTeamSettings(
 // GetCurrentMerkleRoot implements the KeybaseService interface for
 // KeybaseServiceMeasured.
 func (k KeybaseServiceMeasured) GetCurrentMerkleRoot(ctx context.Context) (
-	root keybase1.MerkleRootV2, err error) {
+	root keybase1.MerkleRootV2, updateTime time.Time, err error) {
 	k.getCurrentMerkleRootTimer.Time(func() {
-		root, err = k.delegate.GetCurrentMerkleRoot(ctx)
+		root, updateTime, err = k.delegate.GetCurrentMerkleRoot(ctx)
 	})
-	return root, err
+	return root, updateTime, err
 }
 
-// LoadUnverifiedKeys implements the KeybaseService interface for KeybaseServiceMeasured.
-func (k KeybaseServiceMeasured) LoadUnverifiedKeys(ctx context.Context, uid keybase1.UID) (
-	keys []keybase1.PublicKey, err error) {
-	k.loadUnverifiedKeysTimer.Time(func() {
-		keys, err = k.delegate.LoadUnverifiedKeys(ctx, uid)
+// VerifyMerkleRoot implements the KBPKI interface for
+// KeybaseServiceMeasured.
+func (k KeybaseServiceMeasured) VerifyMerkleRoot(
+	ctx context.Context, root keybase1.MerkleRootV2,
+	kbfsRoot keybase1.KBFSRoot) (err error) {
+	k.verifyMerkleRootTimer.Time(func() {
+		err = k.delegate.VerifyMerkleRoot(ctx, root, kbfsRoot)
 	})
-	return keys, err
+	return err
 }
 
 // CurrentSession implements the KeybaseService interface for
@@ -226,6 +236,16 @@ func (k KeybaseServiceMeasured) Notify(ctx context.Context, notification *keybas
 	return err
 }
 
+// NotifyPathUpdated implements the KeybaseService interface for
+// KeybaseServiceMeasured.
+func (k KeybaseServiceMeasured) NotifyPathUpdated(
+	ctx context.Context, path string) (err error) {
+	k.notifyPathUpdatedTimer.Time(func() {
+		err = k.delegate.NotifyPathUpdated(ctx, path)
+	})
+	return err
+}
+
 // NotifySyncStatus implements the KeybaseService interface for
 // KeybaseServiceMeasured.
 func (k KeybaseServiceMeasured) NotifySyncStatus(ctx context.Context,
@@ -241,13 +261,6 @@ func (k KeybaseServiceMeasured) NotifySyncStatus(ctx context.Context,
 func (k KeybaseServiceMeasured) FlushUserFromLocalCache(
 	ctx context.Context, uid keybase1.UID) {
 	k.delegate.FlushUserFromLocalCache(ctx, uid)
-}
-
-// FlushUserUnverifiedKeysFromLocalCache implements the KeybaseService interface for
-// KeybaseServiceMeasured.
-func (k KeybaseServiceMeasured) FlushUserUnverifiedKeysFromLocalCache(
-	ctx context.Context, uid keybase1.UID) {
-	k.delegate.FlushUserUnverifiedKeysFromLocalCache(ctx, uid)
 }
 
 // EstablishMountDir implements the KeybaseDaemon interface for KeybaseDaemonLocal.

@@ -50,6 +50,8 @@ const (
 	MessageBoxedVersion_VNONE MessageBoxedVersion = 0
 	MessageBoxedVersion_V1    MessageBoxedVersion = 1
 	MessageBoxedVersion_V2    MessageBoxedVersion = 2
+	MessageBoxedVersion_V3    MessageBoxedVersion = 3
+	MessageBoxedVersion_V4    MessageBoxedVersion = 4
 )
 
 func (o MessageBoxedVersion) DeepCopy() MessageBoxedVersion { return o }
@@ -58,12 +60,16 @@ var MessageBoxedVersionMap = map[string]MessageBoxedVersion{
 	"VNONE": 0,
 	"V1":    1,
 	"V2":    2,
+	"V3":    3,
+	"V4":    4,
 }
 
 var MessageBoxedVersionRevMap = map[MessageBoxedVersion]string{
 	0: "VNONE",
 	1: "V1",
 	2: "V2",
+	3: "V3",
+	4: "V4",
 }
 
 func (e MessageBoxedVersion) String() string {
@@ -150,6 +156,7 @@ func (o GetInboxByTLFIDRemoteRes) DeepCopy() GetInboxByTLFIDRemoteRes {
 type GetThreadRemoteRes struct {
 	Thread      ThreadViewBoxed         `codec:"thread" json:"thread"`
 	MembersType ConversationMembersType `codec:"membersType" json:"membersType"`
+	Visibility  keybase1.TLFVisibility  `codec:"visibility" json:"visibility"`
 	RateLimit   *RateLimit              `codec:"rateLimit,omitempty" json:"rateLimit,omitempty"`
 }
 
@@ -157,6 +164,7 @@ func (o GetThreadRemoteRes) DeepCopy() GetThreadRemoteRes {
 	return GetThreadRemoteRes{
 		Thread:      o.Thread.DeepCopy(),
 		MembersType: o.MembersType.DeepCopy(),
+		Visibility:  o.Visibility.DeepCopy(),
 		RateLimit: (func(x *RateLimit) *RateLimit {
 			if x == nil {
 				return nil
@@ -746,6 +754,36 @@ func (o SetRetentionRes) DeepCopy() SetRetentionRes {
 	}
 }
 
+type SetConvMinWriterRoleRes struct {
+	RateLimit *RateLimit `codec:"rateLimit,omitempty" json:"rateLimit,omitempty"`
+}
+
+func (o SetConvMinWriterRoleRes) DeepCopy() SetConvMinWriterRoleRes {
+	return SetConvMinWriterRoleRes{
+		RateLimit: (func(x *RateLimit) *RateLimit {
+			if x == nil {
+				return nil
+			}
+			tmp := (*x).DeepCopy()
+			return &tmp
+		})(o.RateLimit),
+	}
+}
+
+type SweepRes struct {
+	FoundTask       bool    `codec:"foundTask" json:"foundTask"`
+	DeletedMessages bool    `codec:"deletedMessages" json:"deletedMessages"`
+	Expunge         Expunge `codec:"expunge" json:"expunge"`
+}
+
+func (o SweepRes) DeepCopy() SweepRes {
+	return SweepRes{
+		FoundTask:       o.FoundTask,
+		DeletedMessages: o.DeletedMessages,
+		Expunge:         o.Expunge.DeepCopy(),
+	}
+}
+
 type GetInboxRemoteArg struct {
 	Vers       InboxVers      `codec:"vers" json:"vers"`
 	Query      *GetInboxQuery `codec:"query,omitempty" json:"query,omitempty"`
@@ -754,6 +792,7 @@ type GetInboxRemoteArg struct {
 
 type GetThreadRemoteArg struct {
 	ConversationID ConversationID  `codec:"conversationID" json:"conversationID"`
+	Reason         GetThreadReason `codec:"reason" json:"reason"`
 	Query          *GetThreadQuery `codec:"query,omitempty" json:"query,omitempty"`
 	Pagination     *Pagination     `codec:"pagination,omitempty" json:"pagination,omitempty"`
 }
@@ -784,8 +823,9 @@ type NewConversationRemote2Arg struct {
 }
 
 type GetMessagesRemoteArg struct {
-	ConversationID ConversationID `codec:"conversationID" json:"conversationID"`
-	MessageIDs     []MessageID    `codec:"messageIDs" json:"messageIDs"`
+	ConversationID ConversationID   `codec:"conversationID" json:"conversationID"`
+	ThreadReason   *GetThreadReason `codec:"threadReason,omitempty" json:"threadReason,omitempty"`
+	MessageIDs     []MessageID      `codec:"messageIDs" json:"messageIDs"`
 }
 
 type MarkAsReadArg struct {
@@ -835,11 +875,12 @@ type SyncAllArg struct {
 }
 
 type TlfFinalizeArg struct {
-	TlfID          TLFID        `codec:"tlfID" json:"tlfID"`
-	ResetUser      string       `codec:"resetUser" json:"resetUser"`
-	ResetDate      string       `codec:"resetDate" json:"resetDate"`
-	ResetTimestamp gregor1.Time `codec:"resetTimestamp" json:"resetTimestamp"`
-	ResetFull      string       `codec:"resetFull" json:"resetFull"`
+	TlfID          TLFID         `codec:"tlfID" json:"tlfID"`
+	ResetUser      string        `codec:"resetUser" json:"resetUser"`
+	ResetDate      string        `codec:"resetDate" json:"resetDate"`
+	ResetTimestamp gregor1.Time  `codec:"resetTimestamp" json:"resetTimestamp"`
+	ResetFull      string        `codec:"resetFull" json:"resetFull"`
+	ResetUID       *keybase1.UID `codec:"resetUID,omitempty" json:"resetUID,omitempty"`
 }
 
 type TlfResolveArg struct {
@@ -912,13 +953,24 @@ type RemoteNotificationSuccessfulArg struct {
 }
 
 type SetConvRetentionArg struct {
-	ConvID ConversationID  `codec:"convID" json:"convID"`
-	Policy RetentionPolicy `codec:"policy" json:"policy"`
+	ConvID       ConversationID  `codec:"convID" json:"convID"`
+	Policy       RetentionPolicy `codec:"policy" json:"policy"`
+	SweepChannel uint64          `codec:"sweepChannel" json:"sweepChannel"`
 }
 
 type SetTeamRetentionArg struct {
-	TeamID keybase1.TeamID `codec:"teamID" json:"teamID"`
-	Policy RetentionPolicy `codec:"policy" json:"policy"`
+	TeamID       keybase1.TeamID `codec:"teamID" json:"teamID"`
+	Policy       RetentionPolicy `codec:"policy" json:"policy"`
+	SweepChannel uint64          `codec:"sweepChannel" json:"sweepChannel"`
+}
+
+type SetConvMinWriterRoleArg struct {
+	ConvID ConversationID    `codec:"convID" json:"convID"`
+	Role   keybase1.TeamRole `codec:"role" json:"role"`
+}
+
+type RetentionSweepConvArg struct {
+	ConvID ConversationID `codec:"convID" json:"convID"`
 }
 
 type UpgradeKBFSToImpteamArg struct {
@@ -959,6 +1011,8 @@ type RemoteInterface interface {
 	RemoteNotificationSuccessful(context.Context, RemoteNotificationSuccessfulArg) error
 	SetConvRetention(context.Context, SetConvRetentionArg) (SetRetentionRes, error)
 	SetTeamRetention(context.Context, SetTeamRetentionArg) (SetRetentionRes, error)
+	SetConvMinWriterRole(context.Context, SetConvMinWriterRoleArg) (SetConvMinWriterRoleRes, error)
+	RetentionSweepConv(context.Context, ConversationID) (SweepRes, error)
 	UpgradeKBFSToImpteam(context.Context, TLFID) error
 }
 
@@ -1489,6 +1543,38 @@ func RemoteProtocol(i RemoteInterface) rpc.Protocol {
 				},
 				MethodType: rpc.MethodCall,
 			},
+			"setConvMinWriterRole": {
+				MakeArg: func() interface{} {
+					ret := make([]SetConvMinWriterRoleArg, 1)
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[]SetConvMinWriterRoleArg)
+					if !ok {
+						err = rpc.NewTypeError((*[]SetConvMinWriterRoleArg)(nil), args)
+						return
+					}
+					ret, err = i.SetConvMinWriterRole(ctx, (*typedArgs)[0])
+					return
+				},
+				MethodType: rpc.MethodCall,
+			},
+			"retentionSweepConv": {
+				MakeArg: func() interface{} {
+					ret := make([]RetentionSweepConvArg, 1)
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[]RetentionSweepConvArg)
+					if !ok {
+						err = rpc.NewTypeError((*[]RetentionSweepConvArg)(nil), args)
+						return
+					}
+					ret, err = i.RetentionSweepConv(ctx, (*typedArgs)[0].ConvID)
+					return
+				},
+				MethodType: rpc.MethodCall,
+			},
 			"upgradeKBFSToImpteam": {
 				MakeArg: func() interface{} {
 					ret := make([]UpgradeKBFSToImpteamArg, 1)
@@ -1686,6 +1772,17 @@ func (c RemoteClient) SetConvRetention(ctx context.Context, __arg SetConvRetenti
 
 func (c RemoteClient) SetTeamRetention(ctx context.Context, __arg SetTeamRetentionArg) (res SetRetentionRes, err error) {
 	err = c.Cli.Call(ctx, "chat.1.remote.setTeamRetention", []interface{}{__arg}, &res)
+	return
+}
+
+func (c RemoteClient) SetConvMinWriterRole(ctx context.Context, __arg SetConvMinWriterRoleArg) (res SetConvMinWriterRoleRes, err error) {
+	err = c.Cli.Call(ctx, "chat.1.remote.setConvMinWriterRole", []interface{}{__arg}, &res)
+	return
+}
+
+func (c RemoteClient) RetentionSweepConv(ctx context.Context, convID ConversationID) (res SweepRes, err error) {
+	__arg := RetentionSweepConvArg{ConvID: convID}
+	err = c.Cli.Call(ctx, "chat.1.remote.retentionSweepConv", []interface{}{__arg}, &res)
 	return
 }
 

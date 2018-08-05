@@ -213,7 +213,10 @@ func (cc *crChain) getActionsToMerge(
 		}
 		// no conflicts!
 		if !conflict {
-			actions = append(actions, unmergedOp.getDefaultAction(mergedPath))
+			action := unmergedOp.getDefaultAction(mergedPath)
+			if action != nil {
+				actions = append(actions, action)
+			}
 		}
 	}
 
@@ -492,9 +495,17 @@ func (ccs *crChains) makeChainForOp(op op) error {
 	for _, ptr := range op.Unrefs() {
 		// Look up the original pointer corresponding to this most
 		// recent one.
-		original := ptr
-		if ptrChain, ok := ccs.byMostRecent[ptr]; ok {
-			original = ptrChain.original
+		original, ok := ccs.originals[ptr]
+		if !ok {
+			original = ptr
+		}
+
+		// If it has already been updated to something else, we should
+		// just ignore this unref.  See KBFS-3258.
+		if chain, ok := ccs.byOriginal[original]; ok {
+			if ptr != chain.mostRecent {
+				continue
+			}
 		}
 
 		ccs.deletedOriginals[original] = true
@@ -536,7 +547,8 @@ func (ccs *crChains) makeChainForOp(op op) error {
 	case *renameOp:
 		// split rename op into two separate operations, one for
 		// remove and one for create
-		ro, err := newRmOp(realOp.OldName, realOp.OldDir.Unref)
+		ro, err := newRmOp(
+			realOp.OldName, realOp.OldDir.Unref, realOp.RenamedType)
 		if err != nil {
 			return err
 		}
@@ -561,7 +573,10 @@ func (ccs *crChains) makeChainForOp(op op) error {
 		if len(realOp.Unrefs()) > 0 {
 			// Something was overwritten; make an explicit rm for it
 			// so we can check for conflicts.
-			roOverwrite, err := newRmOp(realOp.NewName, ndu)
+			roOverwrite, err := newRmOp(realOp.NewName, ndu,
+				// We don't know the real type, but this op is only
+				// used locally so it doesn't matter.
+				File)
 			if err != nil {
 				return err
 			}
@@ -808,7 +823,7 @@ func (ccs *crChains) addOps(codec kbfscodec.Codec,
 	var oldOps opsList
 	if privateMD.Changes.Info.BlockPointer.IsInitialized() {
 		// In some cases (e.g., journaling) we might not have been
-		// able to re-embed the block changes.  So used the cached
+		// able to re-embed the block changes.  So use the cached
 		// version directly.
 		oldOps = privateMD.cachedChanges.Ops
 	} else {
@@ -1020,6 +1035,8 @@ func (ccs *crChains) copyOpAndRevertUnrefsToOriginals(currOp op) op {
 	case *GCOp:
 		// No need to copy a GCOp, it won't be modified
 		newOp = realOp
+	case *rekeyOp:
+		newOp = realOp
 	}
 	for _, unref := range unrefs {
 		ok := true
@@ -1070,6 +1087,29 @@ func (ccs *crChains) changeOriginal(oldOriginal BlockPointer,
 	return nil
 }
 
+func (ccs *crChains) findPathForDeleted(mostRecent BlockPointer) path {
+	// Find the parent chain that deleted this one.
+	for ptr, chain := range ccs.byMostRecent {
+		for _, op := range chain.ops {
+			ro, ok := op.(*rmOp)
+			if !ok {
+				continue
+			}
+			for _, unref := range ro.Unrefs() {
+				if unref == mostRecent {
+					// If the path isn't set yet, recurse.
+					p := ro.getFinalPath()
+					if !p.isValid() {
+						p = ccs.findPathForDeleted(ptr)
+					}
+					return p.ChildPath(ro.OldName, mostRecent)
+				}
+			}
+		}
+	}
+	return path{}
+}
+
 // getPaths returns a sorted slice of most recent paths to all the
 // nodes in the given CR chains that were directly modified during a
 // branch, and which existed at both the start and the end of the
@@ -1085,6 +1125,7 @@ func (ccs *crChains) getPaths(ctx context.Context, blocks *folderBlockOps,
 	[]path, error) {
 	newPtrs := make(map[BlockPointer]bool)
 	var ptrs []BlockPointer
+	renameOps := make(map[BlockPointer][]*renameOp)
 	for ptr, chain := range ccs.byMostRecent {
 		newPtrs[ptr] = true
 		// We only care about the paths for ptrs that are directly
@@ -1095,6 +1136,22 @@ func (ccs *crChains) getPaths(ctx context.Context, blocks *folderBlockOps,
 			(includeCreates || !ccs.isCreated(chain.original)) &&
 			!ccs.isDeleted(chain.original) {
 			ptrs = append(ptrs, ptr)
+			// Also resolve the old name for any renames, if needed.
+			for _, op := range chain.ops {
+				ro, ok := op.(*renameOp)
+				if !ok {
+					continue
+				}
+
+				oldDirPtr := ro.OldDir.Ref
+				if ro.NewDir != (blockUpdate{}) {
+					if !newPtrs[oldDirPtr] {
+						ptrs = append(ptrs, oldDirPtr)
+						newPtrs[oldDirPtr] = true
+					}
+					renameOps[oldDirPtr] = append(renameOps[oldDirPtr], ro)
+				}
+			}
 		}
 	}
 
@@ -1115,11 +1172,22 @@ func (ccs *crChains) getPaths(ctx context.Context, blocks *folderBlockOps,
 		paths = append(paths, p)
 
 		// update the unmerged final paths
-		chain, ok := ccs.byMostRecent[ptr]
-		if !ok {
-			log.CErrorf(ctx, "Couldn't find chain for found path: %v", ptr)
+		if chain, ok := ccs.byMostRecent[ptr]; ok {
+			for _, op := range chain.ops {
+				op.setFinalPath(p)
+			}
+		}
+		for _, ro := range renameOps[ptr] {
+			ro.oldFinalPath = p
+		}
+	}
+
+	// Fill in the paths for any deleted entries.
+	for ptr, chain := range ccs.byMostRecent {
+		if !ccs.isDeleted(chain.original) {
 			continue
 		}
+		p := ccs.findPathForDeleted(ptr)
 		for _, op := range chain.ops {
 			op.setFinalPath(p)
 		}
@@ -1143,4 +1211,46 @@ func (ccs *crChains) remove(ctx context.Context, log logger.Logger,
 		}
 	}
 	return chainsWithRemovals
+}
+
+func (ccs *crChains) revertRenames(oldOps []op) {
+	for _, op := range oldOps {
+		if rop, ok := op.(*renameOp); ok {
+			// Replace the corresponding createOp, and remove the
+			// rmOp.
+			oldChain, ok := ccs.byMostRecent[rop.OldDir.Ref]
+			if !ok {
+				continue
+			}
+			for i, oldOp := range oldChain.ops {
+				if rmop, ok := oldOp.(*rmOp); ok &&
+					rmop.OldName == rop.OldName {
+					rop.oldFinalPath = rmop.getFinalPath()
+					oldChain.ops = append(
+						oldChain.ops[:i], oldChain.ops[i+1:]...)
+				}
+			}
+
+			if !rop.oldFinalPath.isValid() {
+				// We don't need to revert any renames without an
+				// rmOp, because it was probably just created and
+				// renamed within a single journal update.
+				continue
+			}
+
+			newChain := oldChain
+			if rop.NewDir != (blockUpdate{}) {
+				newChain = ccs.byMostRecent[rop.NewDir.Ref]
+			}
+
+			for i, newOp := range newChain.ops {
+				if cop, ok := newOp.(*createOp); ok &&
+					cop.renamed && cop.NewName == rop.NewName {
+					rop.setFinalPath(cop.getFinalPath())
+					newChain.ops[i] = rop
+					break
+				}
+			}
+		}
+	}
 }

@@ -73,8 +73,21 @@ type Root struct {
 // and is useful for caching a *libfs.FS object without the downside of caching
 // a libkbfs.Node that can be obsolete when it's renamed or removed.
 type CacheableFS struct {
-	fs     *libfs.FS
-	subdir string
+	obsoleteTrackingCh <-chan struct{}
+	fs                 *libfs.FS
+	subdir             string
+}
+
+// IsObsolete returns true if fs has reached the end of life, because of a
+// handle change for example. In this case user should not use this fs anymore,
+// but instead make a new one.
+func (fs CacheableFS) IsObsolete() bool {
+	select {
+	case <-fs.obsoleteTrackingCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // Use returns a *libfs.FS to use.
@@ -116,14 +129,20 @@ func (r *Root) MakeFS(
 		if err != nil {
 			return CacheableFS{}, tlf.ID{}, nil, err
 		}
-		tlfFS, err := libfs.NewFS(fsCtx, kbfsConfig,
-			tlfHandle, "", "", keybase1.MDPriorityNormal)
+		tlfFS, err := libfs.NewFS(
+			fsCtx, kbfsConfig, tlfHandle, libkbfs.MasterBranch, "", "",
+			keybase1.MDPriorityNormal)
+		if err != nil {
+			return CacheableFS{}, tlf.ID{}, nil, err
+		}
+		obsoleteCh, err := tlfFS.SubscribeToObsolete()
 		if err != nil {
 			return CacheableFS{}, tlf.ID{}, nil, err
 		}
 		cacheableFS := CacheableFS{
-			fs:     tlfFS,
-			subdir: r.PathUnparsed,
+			obsoleteTrackingCh: obsoleteCh,
+			fs:                 tlfFS,
+			subdir:             r.PathUnparsed,
 		}
 		if _, err = cacheableFS.Use(); err != nil {
 			return CacheableFS{}, tlf.ID{}, nil, err
@@ -143,7 +162,8 @@ func (r *Root) MakeFS(
 		if err != nil {
 			return CacheableFS{}, tlf.ID{}, nil, err
 		}
-		autogitTLFFS, err := libfs.NewFS(fsCtx, kbfsConfig, tlfHandle,
+		autogitTLFFS, err := libfs.NewFS(
+			fsCtx, kbfsConfig, tlfHandle, libkbfs.MasterBranch,
 			fmt.Sprintf("%s/%s", libgit.AutogitTLFListDir(r.TlfType),
 				r.TlfNameUnparsed), "",
 			keybase1.MDPriorityNormal)

@@ -43,9 +43,9 @@ const (
 // MakeTestConfigOrBust or ConfigAsUser.
 //
 // TODO: Move more common code here.
-func newConfigForTest(mode InitMode,
-	loggerFn func(module string) logger.Logger) *ConfigLocal {
-	config := NewConfigLocal(mode|InitTest, loggerFn, "", DiskCacheModeOff, &env.KBFSContext{})
+func newConfigForTest(modeType InitModeType, loggerFn func(module string) logger.Logger) *ConfigLocal {
+	mode := modeTest{NewInitModeFromType(modeType)}
+	config := NewConfigLocal(mode, loggerFn, "", DiskCacheModeOff, &env.KBFSContext{})
 
 	bops := NewBlockOpsStandard(config,
 		testBlockRetrievalWorkerQueueSize, testPrefetchWorkerQueueSize)
@@ -117,13 +117,13 @@ func newTestRPCLogFactory(t testLogger) rpc.LogFactory {
 // being logged in.
 func MakeTestConfigOrBustLoggedInWithMode(
 	t logger.TestLogBackend, loggedInIndex int,
-	mode InitMode, users ...libkb.NormalizedUsername) *ConfigLocal {
+	mode InitModeType, users ...libkb.NormalizedUsername) *ConfigLocal {
 	log := logger.NewTestLogger(t)
 	config := newConfigForTest(mode, func(m string) logger.Logger {
 		return log
 	})
 
-	kbfsOps := NewKBFSOpsStandard(config)
+	kbfsOps := NewKBFSOpsStandard(libkb.NewGlobalContext().Init(), config)
 	config.SetKBFSOps(kbfsOps)
 	config.SetNotifier(kbfsOps)
 
@@ -136,6 +136,7 @@ func MakeTestConfigOrBustLoggedInWithMode(
 	daemon := NewKeybaseDaemonMemory(loggedInUser.UID, localUsers, nil,
 		config.Codec())
 	config.SetKeybaseService(daemon)
+	config.SetChat(newChatLocal(config))
 
 	kbpki := NewKBPKIClient(config, config.MakeLogger(""))
 	config.SetKBPKI(kbpki)
@@ -198,12 +199,6 @@ func MakeTestConfigOrBustLoggedInWithMode(
 	// turn off background flushing by default during tests
 	config.noBGFlush = true
 
-	// no auto reclamation
-	config.qrPeriod = 0 * time.Second
-
-	// no min head age
-	config.qrMinHeadAge = 0 * time.Second
-
 	configs := []Config{config}
 	config.allKnownConfigsForTesting = &configs
 
@@ -231,18 +226,24 @@ func MakeTestConfigOrBust(t logger.TestLogBackend,
 // enabled in the returned Config, regardless of the journal status in
 // `config`.
 func ConfigAsUserWithMode(config *ConfigLocal,
-	loggedInUser libkb.NormalizedUsername, mode InitMode) *ConfigLocal {
+	loggedInUser libkb.NormalizedUsername, mode InitModeType) *ConfigLocal {
 	c := newConfigForTest(mode, config.loggerFn)
 	c.SetMetadataVersion(config.MetadataVersion())
 	c.SetRekeyWithPromptWaitTime(config.RekeyWithPromptWaitTime())
 
-	kbfsOps := NewKBFSOpsStandard(c)
+	kbfsOps := NewKBFSOpsStandard(libkb.NewGlobalContext().Init(), c)
 	c.SetKBFSOps(kbfsOps)
 	c.SetNotifier(kbfsOps)
 
 	c.SetKeyManager(NewKeyManagerStandard(c))
 	c.SetMDOps(NewMDOpsStandard(c))
 	c.SetClock(config.Clock())
+
+	if chatLocal, ok := config.Chat().(*chatLocal); ok {
+		c.SetChat(chatLocal.copy(c))
+	} else {
+		c.SetChat(config.Chat())
+	}
 
 	daemon := config.KeybaseService().(*KeybaseDaemonLocal)
 	loggedInUID, ok := daemon.asserts[string(loggedInUser)]
@@ -320,7 +321,9 @@ func ConfigAsUserWithMode(config *ConfigLocal,
 // `config`.
 func ConfigAsUser(config *ConfigLocal,
 	loggedInUser libkb.NormalizedUsername) *ConfigLocal {
-	return ConfigAsUserWithMode(config, loggedInUser, config.Mode())
+	c := ConfigAsUserWithMode(config, loggedInUser, config.Mode().Type())
+	c.mode = config.mode // preserve any unusual test mode wrappers
+	return c
 }
 
 // NewEmptyTLFWriterKeyBundle creates a new empty kbfsmd.TLFWriterKeyBundleV2
@@ -402,7 +405,7 @@ func SwitchDeviceForLocalUserOrBust(t logger.TestLogBackend, config Config, inde
 		t.Fatal(err.Error())
 	}
 
-	if _, ok := config.Crypto().(CryptoLocal); !ok {
+	if _, ok := config.Crypto().(*CryptoLocal); !ok {
 		t.Fatal("Bad crypto")
 	}
 
@@ -480,6 +483,27 @@ func AddTeamWriterForTestOrBust(t logger.TestLogBackend, config Config,
 	}
 }
 
+// RemoveTeamWriterForTest removes the given user from a team.
+func RemoveTeamWriterForTest(
+	config Config, tid keybase1.TeamID, uid keybase1.UID) error {
+	kbd, ok := config.KeybaseService().(*KeybaseDaemonLocal)
+	if !ok {
+		return errors.New("Bad keybase daemon")
+	}
+
+	return kbd.removeTeamWriterForTest(tid, uid)
+}
+
+// RemoveTeamWriterForTestOrBust is like RemoveTeamWriterForTest, but
+// dies if there's an error.
+func RemoveTeamWriterForTestOrBust(t logger.TestLogBackend, config Config,
+	tid keybase1.TeamID, uid keybase1.UID) {
+	err := RemoveTeamWriterForTest(config, tid, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // AddTeamReaderForTest makes the given user a team reader.
 func AddTeamReaderForTest(
 	config Config, tid keybase1.TeamID, uid keybase1.UID) error {
@@ -509,7 +533,8 @@ func AddTeamKeyForTest(config Config, tid keybase1.TeamID) error {
 	}
 
 	ti, err := kbd.LoadTeamPlusKeys(
-		context.Background(), tid, kbfsmd.UnspecifiedKeyGen, keybase1.UserVersion{},
+		context.Background(), tid, tlf.Unknown, kbfsmd.UnspecifiedKeyGen,
+		keybase1.UserVersion{}, kbfscrypto.VerifyingKey{},
 		keybase1.TeamRole_NONE)
 	if err != nil {
 		return err
@@ -608,6 +633,52 @@ func ChangeTeamNameForTestOrBust(t logger.TestLogBackend, config Config,
 	}
 }
 
+// SetGlobalMerkleRootForTest sets the global Merkle root and time.
+func SetGlobalMerkleRootForTest(
+	config Config, root keybase1.MerkleRootV2, rootTime time.Time) error {
+	kbd, ok := config.KeybaseService().(*KeybaseDaemonLocal)
+	if !ok {
+		return errors.New("Bad keybase daemon")
+	}
+
+	kbd.setCurrentMerkleRoot(root, rootTime)
+	return nil
+}
+
+// SetGlobalMerkleRootForTestOrBust is like
+// SetGlobalMerkleRootForTest, but dies if there's an error.
+func SetGlobalMerkleRootForTestOrBust(
+	t logger.TestLogBackend, config Config, root keybase1.MerkleRootV2,
+	rootTime time.Time) {
+	err := SetGlobalMerkleRootForTest(config, root, rootTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// SetKbfsMerkleRootForTest sets a Merkle root for the given KBFS tree ID.
+func SetKbfsMerkleRootForTest(
+	config Config, treeID keybase1.MerkleTreeID,
+	root *kbfsmd.MerkleRoot) error {
+	md, ok := config.MDServer().(mdServerLocal)
+	if !ok {
+		return errors.New("Bad md server")
+	}
+	md.setKbfsMerkleRoot(treeID, root)
+	return nil
+}
+
+// SetKbfsMerkleRootForTestOrBust is like SetKbfsMerkleRootForTest,
+// but dies if there's an error.
+func SetKbfsMerkleRootForTestOrBust(
+	t logger.TestLogBackend, config Config, treeID keybase1.MerkleTreeID,
+	root *kbfsmd.MerkleRoot) {
+	err := SetKbfsMerkleRootForTest(config, treeID, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // EnableImplicitTeamsForTest causes the mdserver to stop returning
 // random TLF IDs for new TLFs.
 func EnableImplicitTeamsForTest(config Config) error {
@@ -679,7 +750,7 @@ func RestartCRForTesting(baseCtx context.Context, config Config,
 
 	// Start a resolution for anything we've missed.
 	lState := makeFBOLockState()
-	if !ops.isMasterBranch(lState) {
+	if ops.isUnmerged(lState) {
 		ops.cr.Resolve(baseCtx, ops.getCurrMDRevision(lState),
 			kbfsmd.RevisionUninitialized)
 	}

@@ -5,33 +5,15 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"strings"
 	"sync"
+	"time"
 
-	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/time/rate"
 )
-
-const (
-	// PermRead is the read permission.
-	PermRead = "read"
-	// PermList is the list permission.
-	PermList = "list"
-	// PermReadAndList allows both read and list.
-	PermReadAndList = "read,list"
-)
-
-// AccessControlV1 defines an access control list (ACL) for the V1 config.
-type AccessControlV1 struct {
-	// WhitelistAdditionalPermissions is a map of username -> permissions that
-	// defines a list of additional permissions that authenticated users have
-	// in addition to AnonymousPermissions.
-	WhitelistAdditionalPermissions map[string]string `json:"whitelist_additional_permissions"`
-	// AnonymousPermissions is the permissions for
-	// unauthenticated/anonymous requests.
-	AnonymousPermissions string `json:"anonymous_permissions"`
-}
 
 // V1 defines a V1 config. Public fields are accessible by `json`
 // encoders and decoder.
@@ -46,6 +28,10 @@ type V1 struct {
 	// Users is a [username -> bcrypt-hashed password] map that defines how
 	// users should be authenticated.
 	Users map[string]string `json:"users"`
+
+	users map[string]password
+
+	bcryptLimiter *rate.Limiter
 
 	// ACLs is a path -> AccessControlV1 map that defines ACLs for different
 	// paths.
@@ -75,15 +61,28 @@ func DefaultV1() *V1 {
 	return v1
 }
 
-func (c *V1) initACLChecker() {
+const bcryptRateLimitInterval = time.Second / 2
+
+func (c *V1) init() {
+	c.bcryptLimiter = rate.NewLimiter(rate.Every(bcryptRateLimitInterval), 1)
 	c.aclChecker, c.aclCheckerInitErr = makeACLCheckerV1(c.ACLs, c.Users)
+	if c.aclCheckerInitErr != nil {
+		return
+	}
+	c.users = make(map[string]password)
+	for username, passwordHash := range c.Users {
+		c.users[username], c.aclCheckerInitErr = newPassword(passwordHash)
+		if c.aclCheckerInitErr != nil {
+			return
+		}
+	}
 }
 
 // EnsureInit initializes c, and returns any error encountered during the
 // initialization. It is not necessary to call EnsureInit. Methods that need it
 // does it automatically.
 func (c *V1) EnsureInit() error {
-	c.initOnce.Do(c.initACLChecker)
+	c.initOnce.Do(c.init)
 	return c.aclCheckerInitErr
 }
 
@@ -93,12 +92,17 @@ func (c *V1) Version() Version {
 }
 
 // Authenticate implements the Config interface.
-func (c *V1) Authenticate(username, password string) bool {
-	passwordHash, ok := c.Users[username]
+func (c *V1) Authenticate(ctx context.Context, username, cleartextPassword string) bool {
+	if c.EnsureInit() != nil {
+		return false
+	}
+
+	p, ok := c.users[username]
 	if !ok {
 		return false
 	}
-	return bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)) == nil
+	match, err := p.check(ctx, c.bcryptLimiter, cleartextPassword)
+	return err == nil && match
 }
 
 // GetPermissions implements the Config interface.
@@ -136,4 +140,18 @@ func (c *V1) Encode(w io.Writer, prettify bool) error {
 func (c *V1) Validate() error {
 	_, err := makeACLCheckerV1(c.ACLs, c.Users)
 	return err
+}
+
+// HasBcryptPasswords checks if any password hash in the config is a bcrypt
+// hash. This method is temporary for migration and will go away.
+func (c *V1) HasBcryptPasswords() (bool, error) {
+	if err := c.EnsureInit(); err != nil {
+		return false, err
+	}
+	for _, pass := range c.users {
+		if pass.passwordType() == passwordTypeBcrypt {
+			return true, nil
+		}
+	}
+	return false, nil
 }

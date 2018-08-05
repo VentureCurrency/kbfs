@@ -60,8 +60,14 @@ func newDiskBlockCacheForTest(config *testDiskBlockCacheConfig,
 	if err != nil {
 		return nil, err
 	}
-	workingSetCache.WaitUntilStarted()
-	syncCache.WaitUntilStarted()
+	err = workingSetCache.WaitUntilStarted()
+	if err != nil {
+		return nil, err
+	}
+	err = syncCache.WaitUntilStarted()
+	if err != nil {
+		return nil, err
+	}
 	params := backpressureDiskLimiterParams{
 		minThreshold:      0.5,
 		maxThreshold:      0.95,
@@ -169,7 +175,7 @@ func TestDiskBlockCachePutAndGet(t *testing.T) {
 	t.Log("Verify that the Get updated the LRU time for the block.")
 	getMd, err := cache.GetMetadata(ctx, block1Ptr.ID)
 	require.NoError(t, err)
-	require.True(t, getMd.LRUTime.After(putMd.LRUTime), "Get LRU time isn't "+
+	require.True(t, getMd.LRUTime.After(putMd.LRUTime.Time), "Get LRU time isn't "+
 		"after the Put LRU time. Put metadata: %+v, Get metadata: %+v",
 		putMd, getMd)
 

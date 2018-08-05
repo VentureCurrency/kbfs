@@ -8,6 +8,7 @@ import (
 	"encoding"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/kbfs/kbfscrypto"
@@ -45,14 +46,21 @@ const (
 	SingleTeam
 )
 
+const (
+	strPrivate    = "private"
+	strPublic     = "public"
+	strSingleTeam = "singleTeam"
+	strTeam       = "team"
+)
+
 func (t Type) String() string {
 	switch t {
 	case Private:
-		return "private"
+		return strPrivate
 	case Public:
-		return "public"
+		return strPublic
 	case SingleTeam:
-		return "singleTeam"
+		return strSingleTeam
 	default:
 		return fmt.Sprintf("Unknown TLF type: %d", t)
 	}
@@ -70,6 +78,31 @@ func (t Type) FolderType() keybase1.FolderType {
 		return keybase1.FolderType_TEAM
 	default:
 		return keybase1.FolderType_UNKNOWN
+	}
+}
+
+// ErrUnknownTLFType is returned by ParseTlfType when an unknown TLF type
+// string is provided.
+type ErrUnknownTLFType struct {
+	unknownType string
+}
+
+// Error implements the error interface.
+func (e ErrUnknownTLFType) Error() string {
+	return "unknown TLF type: " + e.unknownType
+}
+
+// ParseTlfTypeFromPath parses str into a Type.
+func ParseTlfTypeFromPath(str string) (Type, error) {
+	switch strings.ToLower(str) {
+	case strPrivate:
+		return Private, nil
+	case strPublic:
+		return Public, nil
+	case strTeam:
+		return SingleTeam, nil
+	default:
+		return Unknown, ErrUnknownTLFType{unknownType: str}
 	}
 }
 

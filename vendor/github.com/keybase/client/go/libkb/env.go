@@ -6,6 +6,7 @@ package libkb
 import (
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -23,6 +24,7 @@ func (n NullConfiguration) GetHome() string                                     
 func (n NullConfiguration) GetServerURI() string                                           { return "" }
 func (n NullConfiguration) GetConfigFilename() string                                      { return "" }
 func (n NullConfiguration) GetUpdaterConfigFilename() string                               { return "" }
+func (n NullConfiguration) GetDeviceCloneStateFilename() string                            { return "" }
 func (n NullConfiguration) GetSessionFilename() string                                     { return "" }
 func (n NullConfiguration) GetDbFilename() string                                          { return "" }
 func (n NullConfiguration) GetChatDbFilename() string                                      { return "" }
@@ -30,6 +32,7 @@ func (n NullConfiguration) GetPvlKitFilename() string                           
 func (n NullConfiguration) GetUsername() NormalizedUsername                                { return NormalizedUsername("") }
 func (n NullConfiguration) GetEmail() string                                               { return "" }
 func (n NullConfiguration) GetUpgradePerUserKey() (bool, bool)                             { return false, false }
+func (n NullConfiguration) GetAutoWallet() (bool, bool)                                    { return false, false }
 func (n NullConfiguration) GetProxy() string                                               { return "" }
 func (n NullConfiguration) GetGpgHome() string                                             { return "" }
 func (n NullConfiguration) GetBundledCA(h string) string                                   { return "" }
@@ -42,6 +45,7 @@ func (n NullConfiguration) GetLinkCacheSize() (int, bool)                       
 func (n NullConfiguration) GetLinkCacheCleanDur() (time.Duration, bool)                    { return 0, false }
 func (n NullConfiguration) GetUPAKCacheSize() (int, bool)                                  { return 0, false }
 func (n NullConfiguration) GetUIDMapFullNameCacheSize() (int, bool)                        { return 0, false }
+func (n NullConfiguration) GetPayloadCacheSize() (int, bool)                               { return 0, false }
 func (n NullConfiguration) GetMerkleKIDs() []string                                        { return nil }
 func (n NullConfiguration) GetCodeSigningKIDs() []string                                   { return nil }
 func (n NullConfiguration) GetPinentry() string                                            { return "" }
@@ -60,36 +64,44 @@ func (n NullConfiguration) GetDeviceID() keybase1.DeviceID                      
 func (n NullConfiguration) GetDeviceIDForUsername(un NormalizedUsername) keybase1.DeviceID { return "" }
 func (n NullConfiguration) GetDeviceIDForUID(u keybase1.UID) keybase1.DeviceID             { return "" }
 func (n NullConfiguration) GetProxyCACerts() ([]string, error)                             { return nil, nil }
-func (n NullConfiguration) GetAutoFork() (bool, bool)                                      { return false, false }
-func (n NullConfiguration) GetRunMode() (RunMode, error)                                   { return NoRunMode, nil }
-func (n NullConfiguration) GetNoAutoFork() (bool, bool)                                    { return false, false }
-func (n NullConfiguration) GetLogFile() string                                             { return "" }
-func (n NullConfiguration) GetScraperTimeout() (time.Duration, bool)                       { return 0, false }
-func (n NullConfiguration) GetAPITimeout() (time.Duration, bool)                           { return 0, false }
-func (n NullConfiguration) GetTorMode() (TorMode, error)                                   { return TorNone, nil }
-func (n NullConfiguration) GetTorHiddenAddress() string                                    { return "" }
-func (n NullConfiguration) GetTorProxy() string                                            { return "" }
-func (n NullConfiguration) GetUpdatePreferenceAuto() (bool, bool)                          { return false, false }
-func (n NullConfiguration) GetUpdatePreferenceSnoozeUntil() keybase1.Time                  { return keybase1.Time(0) }
-func (n NullConfiguration) GetUpdateLastChecked() keybase1.Time                            { return keybase1.Time(0) }
-func (n NullConfiguration) GetUpdatePreferenceSkip() string                                { return "" }
-func (n NullConfiguration) GetUpdateURL() string                                           { return "" }
-func (n NullConfiguration) GetUpdateDisabled() (bool, bool)                                { return false, false }
-func (n NullConfiguration) GetVDebugSetting() string                                       { return "" }
-func (n NullConfiguration) GetLocalTrackMaxAge() (time.Duration, bool)                     { return 0, false }
-func (n NullConfiguration) GetGregorURI() string                                           { return "" }
-func (n NullConfiguration) GetGregorSaveInterval() (time.Duration, bool)                   { return 0, false }
-func (n NullConfiguration) GetGregorPingInterval() (time.Duration, bool)                   { return 0, false }
-func (n NullConfiguration) GetGregorPingTimeout() (time.Duration, bool)                    { return 0, false }
-func (n NullConfiguration) GetChatDelivererInterval() (time.Duration, bool)                { return 0, false }
-func (n NullConfiguration) IsAdmin() (bool, bool)                                          { return false, false }
-func (n NullConfiguration) GetGregorDisabled() (bool, bool)                                { return false, false }
-func (n NullConfiguration) GetMountDir() string                                            { return "" }
-func (n NullConfiguration) GetBGIdentifierDisabled() (bool, bool)                          { return false, false }
-func (n NullConfiguration) GetFeatureFlags() (FeatureFlags, error)                         { return FeatureFlags{}, nil }
-func (n NullConfiguration) GetAppType() AppType                                            { return NoAppType }
-func (n NullConfiguration) GetLevelDBNumFiles() (int, bool)                                { return 0, false }
-func (n NullConfiguration) GetChatInboxSourceLocalizeThreads() (int, bool)                 { return 1, false }
+func (n NullConfiguration) GetUsernameForUID(u keybase1.UID) NormalizedUsername {
+	return NormalizedUsername("")
+}
+func (n NullConfiguration) GetUIDForUsername(u NormalizedUsername) keybase1.UID {
+	return keybase1.UID("")
+}
+func (n NullConfiguration) GetAutoFork() (bool, bool)                       { return false, false }
+func (n NullConfiguration) GetRunMode() (RunMode, error)                    { return NoRunMode, nil }
+func (n NullConfiguration) GetNoAutoFork() (bool, bool)                     { return false, false }
+func (n NullConfiguration) GetLogFile() string                              { return "" }
+func (n NullConfiguration) GetLogPrefix() string                            { return "" }
+func (n NullConfiguration) GetScraperTimeout() (time.Duration, bool)        { return 0, false }
+func (n NullConfiguration) GetAPITimeout() (time.Duration, bool)            { return 0, false }
+func (n NullConfiguration) GetTorMode() (TorMode, error)                    { return TorNone, nil }
+func (n NullConfiguration) GetTorHiddenAddress() string                     { return "" }
+func (n NullConfiguration) GetTorProxy() string                             { return "" }
+func (n NullConfiguration) GetUpdatePreferenceAuto() (bool, bool)           { return false, false }
+func (n NullConfiguration) GetUpdatePreferenceSnoozeUntil() keybase1.Time   { return keybase1.Time(0) }
+func (n NullConfiguration) GetUpdateLastChecked() keybase1.Time             { return keybase1.Time(0) }
+func (n NullConfiguration) GetUpdatePreferenceSkip() string                 { return "" }
+func (n NullConfiguration) GetUpdateURL() string                            { return "" }
+func (n NullConfiguration) GetUpdateDisabled() (bool, bool)                 { return false, false }
+func (n NullConfiguration) GetVDebugSetting() string                        { return "" }
+func (n NullConfiguration) GetLocalTrackMaxAge() (time.Duration, bool)      { return 0, false }
+func (n NullConfiguration) GetGregorURI() string                            { return "" }
+func (n NullConfiguration) GetGregorSaveInterval() (time.Duration, bool)    { return 0, false }
+func (n NullConfiguration) GetGregorPingInterval() (time.Duration, bool)    { return 0, false }
+func (n NullConfiguration) GetGregorPingTimeout() (time.Duration, bool)     { return 0, false }
+func (n NullConfiguration) GetChatDelivererInterval() (time.Duration, bool) { return 0, false }
+func (n NullConfiguration) GetGregorDisabled() (bool, bool)                 { return false, false }
+func (n NullConfiguration) GetMountDir() string                             { return "" }
+func (n NullConfiguration) GetBGIdentifierDisabled() (bool, bool)           { return false, false }
+func (n NullConfiguration) GetFeatureFlags() (FeatureFlags, error)          { return FeatureFlags{}, nil }
+func (n NullConfiguration) GetAppType() AppType                             { return NoAppType }
+func (n NullConfiguration) GetSlowGregorConn() (bool, bool)                 { return false, false }
+func (n NullConfiguration) GetRememberPassphrase() (bool, bool)             { return false, false }
+func (n NullConfiguration) GetLevelDBNumFiles() (int, bool)                 { return 0, false }
+func (n NullConfiguration) GetChatInboxSourceLocalizeThreads() (int, bool)  { return 1, false }
 func (n NullConfiguration) GetBug3964RepairTime(NormalizedUsername) (time.Time, error) {
 	return time.Time{}, nil
 }
@@ -104,8 +116,14 @@ func (n NullConfiguration) GetBool(string, bool) (bool, bool) { return false, fa
 func (n NullConfiguration) GetAllUsernames() (NormalizedUsername, []NormalizedUsername, error) {
 	return NormalizedUsername(""), nil, nil
 }
+func (n NullConfiguration) GetAllUserConfigs() (*UserConfig, []UserConfig, error) {
+	return nil, nil, nil
+}
 
 func (n NullConfiguration) GetDebug() (bool, bool) {
+	return false, false
+}
+func (n NullConfiguration) GetDisplayRawUntrustedOutput() (bool, bool) {
 	return false, false
 }
 func (n NullConfiguration) GetLogFormat() string {
@@ -155,9 +173,21 @@ type TestParameters struct {
 	DevelName                string
 	RuntimeDir               string
 	DisableUpgradePerUserKey bool
+	DisableAutoWallet        bool
 
 	// set to true to use production run mode in tests
 	UseProductionRunMode bool
+
+	// whether LogoutIfRevoked check should be skipped to avoid races
+	// during resets.
+	SkipLogoutIfRevokedCheck bool
+
+	// On if, in test, we want to skip sending system chat messages
+	SkipSendingSystemChatMessages bool
+
+	// If we need to use the real clock for NIST generation (as in really
+	// whacky tests liks TestRekey).
+	UseTimeClockForNISTs bool
 }
 
 func (tp TestParameters) GetDebug() (bool, bool) {
@@ -221,19 +251,6 @@ func (e *Env) GetUpdaterConfig() UpdaterConfigReader {
 }
 
 func (e *Env) GetMountDir() (string, error) {
-	var darwinMountsubdir string
-	runMode := e.GetRunMode()
-	switch runMode {
-	case DevelRunMode:
-		darwinMountsubdir = "keybase.devel"
-	case StagingRunMode:
-		darwinMountsubdir = "keybase.staging"
-	case ProductionRunMode:
-		darwinMountsubdir = "keybase"
-	default:
-		return "", fmt.Errorf("Invalid run mode: %s", runMode)
-	}
-
 	return e.GetString(
 		func() string { return e.cmd.GetMountDir() },
 		func() string { return os.Getenv("KEYBASE_MOUNTDIR") },
@@ -241,12 +258,31 @@ func (e *Env) GetMountDir() (string, error) {
 		func() string {
 			switch runtime.GOOS {
 			case "darwin":
-				return filepath.Join(
-					string(filepath.Separator), darwinMountsubdir)
+				volumes := "/Volumes"
+				user, err := user.Current()
+				if err != nil {
+					panic(fmt.Sprintf("Couldn't get current user: %+v", err))
+				}
+				var runmodeName string
+				switch e.GetRunMode() {
+				case DevelRunMode:
+					runmodeName = "KeybaseDevel"
+				case StagingRunMode:
+					runmodeName = "KeybaseStaging"
+				case ProductionRunMode:
+					runmodeName = "Keybase"
+				default:
+					panic("Invalid run mode")
+				}
+				return filepath.Join(volumes, fmt.Sprintf(
+					"%s (%s)", runmodeName, user.Username))
 			case "linux":
-				return filepath.Join(e.GetDataDir(), "fs")
-			default:
+				return filepath.Join(e.GetRuntimeDir(), "kbfs")
+			// kbfsdokan depends on an empty default
+			case "windows":
 				return ""
+			default:
+				return filepath.Join(e.GetRuntimeDir(), "kbfs")
 			}
 		},
 	), nil
@@ -287,6 +323,14 @@ func (e *Env) GetCacheDir() string        { return e.HomeFinder.CacheDir() }
 func (e *Env) GetSandboxCacheDir() string { return e.HomeFinder.SandboxCacheDir() }
 func (e *Env) GetDataDir() string         { return e.HomeFinder.DataDir() }
 func (e *Env) GetLogDir() string          { return e.HomeFinder.LogDir() }
+
+func (e *Env) SendSystemChatMessages() bool {
+	return !e.Test.SkipSendingSystemChatMessages
+}
+
+func (e *Env) UseTimeClockForNISTs() bool {
+	return e.Test.UseTimeClockForNISTs
+}
 
 func (e *Env) GetRuntimeDir() string {
 	return e.GetString(
@@ -444,6 +488,15 @@ func (e *Env) GetUpdaterConfigFilename() string {
 	)
 }
 
+func (e *Env) GetDeviceCloneStateFilename() string {
+	return e.GetString(
+		func() string { return e.cmd.GetDeviceCloneStateFilename() },
+		func() string { return os.Getenv("KEYBASE_DEVICE_CLONE_STATE_FILE") },
+		func() string { return e.GetConfig().GetDeviceCloneStateFilename() },
+		func() string { return filepath.Join(e.GetConfigDir(), DeviceCloneStateFile) },
+	)
+}
+
 func (e *Env) GetSessionFilename() string {
 	return e.GetString(
 		func() string { return e.cmd.GetSessionFilename() },
@@ -487,6 +540,14 @@ func (e *Env) GetDebug() bool {
 		func() (bool, bool) { return e.cmd.GetDebug() },
 		func() (bool, bool) { return e.getEnvBool("KEYBASE_DEBUG") },
 		func() (bool, bool) { return e.GetConfig().GetDebug() },
+	)
+}
+
+func (e *Env) GetDisplayRawUntrustedOutput() bool {
+	return e.GetBool(false,
+		func() (bool, bool) { return e.cmd.GetDisplayRawUntrustedOutput() },
+		func() (bool, bool) { return e.getEnvBool("KEYBASE_DISPLAY_RAW_UNTRUSTED_OUTPUT") },
+		func() (bool, bool) { return e.GetConfig().GetDisplayRawUntrustedOutput() },
 	)
 }
 
@@ -552,6 +613,12 @@ func (e *Env) GetAPIDump() bool {
 	return e.GetBool(false,
 		func() (bool, bool) { return e.cmd.GetAPIDump() },
 		func() (bool, bool) { return e.getEnvBool("KEYBASE_API_DUMP") },
+	)
+}
+
+func (e *Env) GetAllowRoot() bool {
+	return e.GetBool(false,
+		func() (bool, bool) { return e.getEnvBool("KEYBASE_ALLOW_ROOT") },
 	)
 }
 
@@ -649,7 +716,7 @@ func (e *Env) GetGregorPingTimeout() time.Duration {
 }
 
 func (e *Env) GetChatDelivererInterval() time.Duration {
-	return e.GetDuration(30*time.Second,
+	return e.GetDuration(5*time.Second,
 		func() (time.Duration, bool) { return e.getEnvDuration("KEYBASE_CHAT_DELIVERER_INTERVAL") },
 		func() (time.Duration, bool) { return e.GetConfig().GetChatDelivererInterval() },
 		func() (time.Duration, bool) { return e.cmd.GetChatDelivererInterval() },
@@ -677,6 +744,17 @@ func (e *Env) GetEmail() string {
 // Upgrade sigchains to contain per-user-keys.
 func (e *Env) GetUpgradePerUserKey() bool {
 	return !e.Test.DisableUpgradePerUserKey
+}
+
+// Automatically create a wallet for the logged-in user.
+func (e *Env) GetAutoWallet() bool {
+	return !e.Test.DisableAutoWallet
+}
+
+// If true, do not logout after user.key_change notification handler
+// decides that current device has been revoked.
+func (e *Env) GetSkipLogoutIfRevokedCheck() bool {
+	return e.Test.SkipLogoutIfRevokedCheck
 }
 
 func (e *Env) GetProxy() string {
@@ -835,6 +913,14 @@ func (e *Env) GetLinkCacheCleanDur() time.Duration {
 	)
 }
 
+func (e *Env) GetPayloadCacheSize() int {
+	return e.GetInt(PayloadCacheSize,
+		e.cmd.GetPayloadCacheSize,
+		func() (int, bool) { return e.getEnvInt("KEYBASE_PAYLOAD_CACHE_SIZE") },
+		e.GetConfig().GetPayloadCacheSize,
+	)
+}
+
 func (e *Env) GetEmailOrUsername() string {
 	un := e.GetUsername().String()
 	if len(un) > 0 {
@@ -882,6 +968,14 @@ func (e *Env) GetAppType() AppType {
 	default:
 		return NoAppType
 	}
+}
+
+func (e *Env) GetSlowGregorConn() bool {
+	return e.GetBool(false,
+		func() (bool, bool) { return e.cmd.GetSlowGregorConn() },
+		func() (bool, bool) { return e.getEnvBool("KEYBASE_SLOW_GREGOR_CONN") },
+		func() (bool, bool) { return e.GetConfig().GetSlowGregorConn() },
+	)
 }
 
 func (e *Env) GetFeatureFlags() FeatureFlags {
@@ -986,10 +1080,6 @@ func (e *Env) GetSecretKeyringTemplate() string {
 	)
 }
 
-func (e *Env) GetSalt() []byte {
-	return e.GetConfig().GetSalt()
-}
-
 func (e *Env) GetLocalRPCDebug() string {
 	return e.GetString(
 		func() string { return e.cmd.GetLocalRPCDebug() },
@@ -1041,6 +1131,13 @@ func (e *Env) GetChatMemberType() string {
 	)
 }
 
+func (e *Env) GetAvatarSource() string {
+	return e.GetString(
+		func() string { return os.Getenv("KEYBASE_AVATAR_SOURCE") },
+		func() string { return "full" },
+	)
+}
+
 func (e *Env) GetDeviceID() keybase1.DeviceID {
 	return e.GetConfig().GetDeviceID()
 }
@@ -1051,6 +1148,10 @@ func (e *Env) GetDeviceIDForUsername(u NormalizedUsername) keybase1.DeviceID {
 
 func (e *Env) GetDeviceIDForUID(u keybase1.UID) keybase1.DeviceID {
 	return e.GetConfig().GetDeviceIDForUID(u)
+}
+
+func (e *Env) GetUsernameForUID(u keybase1.UID) NormalizedUsername {
+	return e.GetConfig().GetUsernameForUID(u)
 }
 
 func (e *Env) GetInstallID() (ret InstallID) {
@@ -1065,6 +1166,10 @@ func (e *Env) GetLogFile() string {
 		func() string { return e.cmd.GetLogFile() },
 		func() string { return os.Getenv("KEYBASE_LOG_FILE") },
 	)
+}
+
+func (e *Env) GetLogPrefix() string {
+	return e.cmd.GetLogPrefix()
 }
 
 func (e *Env) GetDefaultLogFile() string {
@@ -1184,12 +1289,27 @@ func (c AppConfig) GetAppType() AppType {
 	return MobileAppType
 }
 
+func (c AppConfig) GetSlowGregorConn() (bool, bool) {
+	return false, false
+}
+
 func (c AppConfig) GetVDebugSetting() string {
 	return c.VDebugSetting
 }
 
 func (c AppConfig) GetChatInboxSourceLocalizeThreads() (int, bool) {
 	return c.ChatInboxSourceLocalizeThreads, true
+}
+
+// Default is 500, compacted size of each file is 2MB, so turning
+// this down on mobile to reduce mem usage.
+func (c AppConfig) GetLevelDBNumFiles() (int, bool) {
+	return 50, true
+}
+
+// Default is 4000. Turning down on mobile to reduce memory usage.
+func (c AppConfig) GetLinkCacheSize() (int, bool) {
+	return 1000, true
 }
 
 func (e *Env) GetUpdatePreferenceAuto() (bool, bool) {
@@ -1230,11 +1350,6 @@ func (e *Env) GetUpdateURL() string {
 
 func (e *Env) GetUpdateDisabled() (bool, bool) {
 	return e.GetConfig().GetUpdateDisabled()
-}
-
-func (e *Env) IsAdmin() bool {
-	b, _ := e.GetConfig().IsAdmin()
-	return b
 }
 
 func (e *Env) GetVDebugSetting() string {
@@ -1281,9 +1396,27 @@ func (e *Env) DarwinForceSecretStoreFile() bool {
 		os.Getenv("KEYBASE_SECRET_STORE_FILE") == "1")
 }
 
+func (e *Env) RememberPassphrase() bool {
+	return e.GetBool(true,
+		e.cmd.GetRememberPassphrase,
+		e.GetConfig().GetRememberPassphrase,
+	)
+}
+
 func GetPlatformString() string {
 	if isIOS {
 		return "ios"
 	}
 	return runtime.GOOS
+}
+
+func IsMobilePlatform() bool {
+	s := GetPlatformString()
+	return (s == "ios" || s == "android")
+}
+
+func (e *Env) AllowPTrace() bool {
+	return e.GetBool(false,
+		func() (bool, bool) { return e.getEnvBool("KEYBASE_ALLOW_PTRACE") },
+	)
 }

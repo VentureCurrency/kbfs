@@ -56,7 +56,9 @@ type WriterMetadataV2 struct {
 	// real v2 MDs in the wild won't ever have this set).
 	MDRefBytes uint64 `codec:",omitempty"`
 
-	Extra WriterMetadataExtraV2 `codec:"x,omitempty,omitemptycheckstruct"`
+	// TODO: Remove omitempty and omitemptycheckstruct once we use
+	// a version of go-codec that supports omitemptyrecursive.
+	Extra WriterMetadataExtraV2 `codec:"x,omitemptyrecursive,omitempty,omitemptycheckstruct"`
 }
 
 // ToWriterMetadataV3 converts the WriterMetadataV2 to a
@@ -411,7 +413,7 @@ func (md *RootMetadataV2) makeSuccessorCopyV3(
 	// Have this as ExtraMetadata so we return an untyped nil
 	// instead of a typed nil.
 	var extraCopy ExtraMetadata
-	if md.LatestKeyGeneration() != PublicKeyGen {
+	if md.LatestKeyGeneration() != PublicKeyGen && md.WKeys != nil {
 		// Fill out the writer key bundle.
 		wkbV2, wkbV3, err := md.WKeys.ToTLFWriterKeyBundleV3(
 			codec, tlfCryptKeyGetter)
@@ -1108,6 +1110,15 @@ func (md *RootMetadataV2) SetFinalizedInfo(fi *tlf.HandleExtension) {
 // SetWriters implements the MutableRootMetadata interface for RootMetadataV2.
 func (md *RootMetadataV2) SetWriters(writers []keybase1.UserOrTeamID) {
 	md.Writers = writers
+}
+
+// ClearForV4Migration implements the MutableRootMetadata interface
+// for RootMetadataV2.
+func (md *RootMetadataV2) ClearForV4Migration() {
+	md.WKeys = nil
+	md.RKeys = nil
+	md.Extra.UnresolvedWriters = nil
+	md.UnresolvedReaders = nil
 }
 
 // SetTlfID implements the MutableRootMetadata interface for RootMetadataV2.

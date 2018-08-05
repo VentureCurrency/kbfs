@@ -5,67 +5,47 @@
 package main
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
-	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/keybase/client/go/minterm"
 	"github.com/keybase/kbfs/libpages/config"
-	"github.com/sergi/go-diff/diffmatchpatch"
-	"golang.org/x/crypto/bcrypt"
 )
 
-type prompter interface {
-	Prompt(string) (string, error)
-	PromptPassword(string) (string, error)
-}
-
-// not go-routine safe!
-type kbpConfigEditor struct {
-	kbpConfigPath     string
-	kbpConfig         *config.V1
-	originalConfigStr string
-	prompter          prompter
-	bcryptCost        int
-}
-
-func readConfig(from io.Reader) (cfg config.Config, str string, err error) {
-	buf := &bytes.Buffer{}
-	if cfg, err = config.ParseConfig(io.TeeReader(from, buf)); err != nil {
-		return nil, "", err
-	}
-	return cfg, buf.String(), nil
-}
-
-func newKBPConfigEditorWithPrompterAndCost(kbpConfigDir string, p prompter, bcryptCost int) (
+func newKBPConfigEditorWithPrompter(kbpConfigDir string, p prompter) (
 	*kbpConfigEditor, error) {
-	fi, err := os.Stat(kbpConfigDir)
+	kbpConfigPath, err := kbpConfigPath(kbpConfigDir)
 	if err != nil {
-		return nil, fmt.Errorf("stat %q error: %v", kbpConfigDir, err)
+		return nil, err
 	}
-	if !fi.IsDir() {
-		return nil, fmt.Errorf("%q is not a directory", kbpConfigDir)
-	}
-	kbpConfigPath := filepath.Join(kbpConfigDir, config.DefaultConfigFilename)
-	editor := &kbpConfigEditor{kbpConfigPath: kbpConfigPath, prompter: p, bcryptCost: bcryptCost}
+	editor := &kbpConfigEditor{kbpConfigPath: kbpConfigPath, prompter: p}
 	f, err := os.Open(kbpConfigPath)
 	switch {
 	case err == nil:
-		defer f.Close()
 		var cfg config.Config
-		cfg, editor.originalConfigStr, err = readConfig(f)
+		cfg, editor.originalConfigStr, err = readConfigAndClose(f)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"reading config file %s error: %v", kbpConfigPath, err)
 		}
-		if cfg.Version() != config.Version1 {
+		switch cfg.Version() {
+		case config.Version1:
+			editor.kbpConfig = cfg.(*config.V1)
+			needsUpgrade, err := editor.kbpConfig.HasBcryptPasswords()
+			if err != nil {
+				return nil, err
+			}
+			if needsUpgrade {
+				return nil, errors.New(
+					"config has bcrypt password hashes. Please run " +
+						"`kbpagesconfig upgrade` to migrate to sha256")
+			}
+		default:
 			return nil, fmt.Errorf(
 				"unsupported config version %s", cfg.Version())
 		}
-		editor.kbpConfig = cfg.(*config.V1)
 	case os.IsNotExist(err):
 		editor.kbpConfig = config.DefaultV1()
 	default:
@@ -80,78 +60,70 @@ func newKBPConfigEditor(kbpConfigDir string) (*kbpConfigEditor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening terminal error: %s", err)
 	}
-	return newKBPConfigEditorWithPrompterAndCost(kbpConfigDir, term, bcrypt.DefaultCost)
+	return newKBPConfigEditorWithPrompter(kbpConfigDir, term)
 }
 
 func (e *kbpConfigEditor) confirmAndWrite() error {
-	buf := &bytes.Buffer{}
-	if err := e.kbpConfig.Encode(buf, true); err != nil {
-		return fmt.Errorf("encoding config error: %v", err)
+	if err := e.kbpConfig.Validate(); err != nil {
+		return fmt.Errorf("new config would not be valid: %v", err)
 	}
-	newConfigStr := buf.String()
-	if newConfigStr == e.originalConfigStr {
-		fmt.Println("no change is made to the config")
-		return nil
+	return confirmAndWrite(
+		e.originalConfigStr, e.kbpConfig, e.kbpConfigPath, e.prompter)
+}
+
+func (e *kbpConfigEditor) setUser(username string, isAdd bool) error {
+	_, userExists := e.kbpConfig.Users[username]
+	if userExists && isAdd {
+		return fmt.Errorf("user %s already exists", username)
 	}
-
-	// print the diff
-	d := diffmatchpatch.New()
-	fmt.Println(
-		d.DiffPrettyText(
-			d.DiffMain(e.originalConfigStr, newConfigStr, true)))
-
-	// ask user to confirm
-	input, err := e.prompter.Prompt(fmt.Sprintf(
-		"confirm writing above changes to %s? (y/N): ", e.kbpConfigPath))
+	if !userExists && !isAdd {
+		return fmt.Errorf("user %s doesn't exist", username)
+	}
+	confirmedRandom, err := promptConfirm(e.prompter, fmt.Sprintf(
+		"We can generate a random password for %s, or you can enter "+
+			"a password. Since we use a fast hash function for password "+
+			"hashing, we recommend generating random passwords with enough "+
+			"entropy. Would you like to generate a random password now "+
+			"(recommended)?", username), true)
 	if err != nil {
 		return fmt.Errorf("getting confirmation error: %v", err)
 	}
-	if strings.ToLower(input) != "y" {
-		return fmt.Errorf("write not confirmed")
+	var password string
+	if confirmedRandom {
+		password, err = generateRandomPassword()
+		if err != nil {
+			return fmt.Errorf("generating random password error: %v", err)
+		}
+		confirmed, err := promptConfirm(e.prompter, fmt.Sprintf(
+			"Here's the password for %s:\n\n\t%s\n\n"+
+				"This is the only time you'll see it, so please write it "+
+				"down or give it to %s. Continue?",
+			username, password, username), false)
+		if err != nil {
+			return fmt.Errorf("getting confirmation error: %v", err)
+		}
+		if !confirmed {
+			return errors.New("not confirmed")
+		}
+	} else {
+		input, err := e.prompter.PromptPassword(fmt.Sprintf(
+			"enter a password for %s: ", username))
+		if err != nil {
+			return fmt.Errorf("getting password error: %v", err)
+		}
+		password = strings.TrimSpace(input)
+		if len(password) == 0 {
+			return fmt.Errorf("empty password")
+		}
 	}
-
-	// write the new config to kbpConfigPath
-	f, err := os.Create(e.kbpConfigPath)
+	hashed, err := config.GenerateSHA256PasswordHash(password)
 	if err != nil {
-		return fmt.Errorf(
-			"opening file [%s] error: %v", e.kbpConfigPath, err)
-	}
-	defer f.Close()
-	if _, err = f.WriteString(newConfigStr); err != nil {
-
-		return fmt.Errorf(
-			"writing config to file [%s] error: %v", e.kbpConfigPath, err)
-	}
-	if err = f.Close(); err != nil {
-		return fmt.Errorf(
-			"closing file [%s] error: %v", e.kbpConfigPath, err)
-	}
-
-	return nil
-}
-
-func (e *kbpConfigEditor) addUser(username string) error {
-	if _, ok := e.kbpConfig.Users[username]; ok {
-		return fmt.Errorf("user %s already exists", username)
-	}
-	input, err := e.prompter.PromptPassword(fmt.Sprintf(
-		"enter a password for %s: ", username))
-	if err != nil {
-		return fmt.Errorf("getting password error: %v", err)
-	}
-	password := strings.TrimSpace(input)
-	if len(password) == 0 {
-		return fmt.Errorf("empty password")
-	}
-	hashed, err := bcrypt.GenerateFromPassword(
-		[]byte(password), e.bcryptCost)
-	if err != nil {
-		return fmt.Errorf("hashing password error: %v", err)
+		return err
 	}
 	if e.kbpConfig.Users == nil {
 		e.kbpConfig.Users = make(map[string]string)
 	}
-	e.kbpConfig.Users[username] = string(hashed)
+	e.kbpConfig.Users[username] = (hashed)
 	return nil
 }
 

@@ -25,6 +25,7 @@ import (
 	"github.com/keybase/client/go/protocol/chat1"
 	gregor1 "github.com/keybase/client/go/protocol/gregor1"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
+	stellar1 "github.com/keybase/client/go/protocol/stellar1"
 	clockwork "github.com/keybase/clockwork"
 	jsonw "github.com/keybase/go-jsonw"
 )
@@ -32,6 +33,7 @@ import (
 type configGetter interface {
 	GetAPITimeout() (time.Duration, bool)
 	GetAppType() AppType
+	GetSlowGregorConn() (bool, bool)
 	GetAutoFork() (bool, bool)
 	GetChatDbFilename() string
 	GetPvlKitFilename() string
@@ -39,7 +41,9 @@ type configGetter interface {
 	GetConfigFilename() string
 	GetDbFilename() string
 	GetDebug() (bool, bool)
+	GetDisplayRawUntrustedOutput() (bool, bool)
 	GetUpgradePerUserKey() (bool, bool)
+	GetAutoWallet() (bool, bool)
 	GetGpg() string
 	GetGpgHome() string
 	GetGpgOptions() []string
@@ -54,6 +58,7 @@ type configGetter interface {
 	GetLocalRPCDebug() string
 	GetLocalTrackMaxAge() (time.Duration, bool)
 	GetLogFile() string
+	GetLogPrefix() string
 	GetLogFormat() string
 	GetMerkleKIDs() []string
 	GetMountDir() string
@@ -75,12 +80,15 @@ type configGetter interface {
 	GetUPAKCacheSize() (int, bool)
 	GetUIDMapFullNameCacheSize() (int, bool)
 	GetUpdaterConfigFilename() string
+	GetDeviceCloneStateFilename() string
 	GetUserCacheMaxAge() (time.Duration, bool)
 	GetVDebugSetting() string
 	GetChatDelivererInterval() (time.Duration, bool)
 	GetFeatureFlags() (FeatureFlags, error)
 	GetLevelDBNumFiles() (int, bool)
 	GetChatInboxSourceLocalizeThreads() (int, bool)
+	GetPayloadCacheSize() (int, bool)
+	GetRememberPassphrase() (bool, bool)
 }
 
 type CommandLine interface {
@@ -134,28 +142,34 @@ type KVStorer interface {
 	Delete(id DbKey) error
 }
 
-type ConfigReader interface {
-	configGetter
-
-	GetUserConfig() (*UserConfig, error)
-	GetUserConfigForUsername(s NormalizedUsername) (*UserConfig, error)
-	GetBundledCA(host string) string
+type JSONReader interface {
 	GetStringAtPath(string) (string, bool)
 	GetInterfaceAtPath(string) (interface{}, error)
 	GetBoolAtPath(string) (bool, bool)
 	GetIntAtPath(string) (int, bool)
 	GetNullAtPath(string) bool
+}
+
+type ConfigReader interface {
+	JSONReader
+	configGetter
+
+	GetUserConfig() (*UserConfig, error)
+	GetUserConfigForUsername(s NormalizedUsername) (*UserConfig, error)
+	GetBundledCA(host string) string
 	GetProofCacheLongDur() (time.Duration, bool)
 	GetProofCacheMediumDur() (time.Duration, bool)
 	GetProofCacheShortDur() (time.Duration, bool)
 	GetLinkCacheCleanDur() (time.Duration, bool)
 	GetNoPinentry() (bool, bool)
-	GetSalt() []byte
 	GetDeviceID() keybase1.DeviceID
 	GetDeviceIDForUsername(nu NormalizedUsername) keybase1.DeviceID
 	GetDeviceIDForUID(u keybase1.UID) keybase1.DeviceID
+	GetUsernameForUID(u keybase1.UID) NormalizedUsername
+	GetUIDForUsername(n NormalizedUsername) keybase1.UID
 	GetUsername() NormalizedUsername
 	GetAllUsernames() (current NormalizedUsername, others []NormalizedUsername, err error)
+	GetAllUserConfigs() (*UserConfig, []UserConfig, error)
 	GetUID() keybase1.UID
 	GetProxyCACerts() ([]string, error)
 	GetSecurityAccessGroupOverride() (bool, bool)
@@ -167,7 +181,6 @@ type ConfigReader interface {
 	GetUpdateLastChecked() keybase1.Time
 	GetUpdateURL() string
 	GetUpdateDisabled() (bool, bool)
-	IsAdmin() (bool, bool)
 }
 
 type UpdaterConfigReader interface {
@@ -179,22 +192,27 @@ type ConfigWriterTransacter interface {
 	Abort() error
 }
 
+type JSONWriter interface {
+	SetStringAtPath(string, string) error
+	SetBoolAtPath(string, bool) error
+	SetIntAtPath(string, int) error
+	SetNullAtPath(string) error
+}
+
 type ConfigWriter interface {
+	JSONWriter
 	SetUserConfig(cfg *UserConfig, overwrite bool) error
 	SwitchUser(un NormalizedUsername) error
 	NukeUser(un NormalizedUsername) error
 	SetDeviceID(keybase1.DeviceID) error
-	SetStringAtPath(string, string) error
-	SetBoolAtPath(string, bool) error
-	SetIntAtPath(string, int) error
 	SetWrapperAtPath(string, *jsonw.Wrapper) error
-	SetNullAtPath(string) error
 	DeleteAtPath(string)
 	SetUpdatePreferenceAuto(bool) error
 	SetUpdatePreferenceSkip(string) error
 	SetUpdatePreferenceSnoozeUntil(keybase1.Time) error
 	SetUpdateLastChecked(keybase1.Time) error
 	SetBug3964RepairTime(NormalizedUsername, time.Time) error
+	SetRememberPassphrase(bool) error
 	Reset()
 	BeginTransaction() (ConfigWriterTransacter, error)
 }
@@ -209,6 +227,7 @@ type Usage struct {
 	KbKeyring  bool
 	API        bool
 	Socket     bool
+	AllowRoot  bool
 }
 
 type Command interface {
@@ -252,8 +271,8 @@ type ExternalAPIRes struct {
 
 type API interface {
 	Get(APIArg) (*APIRes, error)
-	GetResp(APIArg) (*http.Response, func(), error)
 	GetDecode(APIArg, APIResponseWrapper) error
+	GetResp(APIArg) (*http.Response, func(), error)
 	Post(APIArg) (*APIRes, error)
 	PostJSON(APIArg) (*APIRes, error)
 	PostDecode(APIArg, APIResponseWrapper) error
@@ -351,12 +370,6 @@ type ProvisionUI interface {
 }
 
 type ChatUI interface {
-	ChatAttachmentUploadOutboxID(context.Context, chat1.ChatAttachmentUploadOutboxIDArg) error
-	ChatAttachmentUploadStart(context.Context, chat1.AssetMetadata, chat1.MessageID) error
-	ChatAttachmentUploadProgress(context.Context, chat1.ChatAttachmentUploadProgressArg) error
-	ChatAttachmentUploadDone(context.Context) error
-	ChatAttachmentPreviewUploadStart(context.Context, chat1.AssetMetadata) error
-	ChatAttachmentPreviewUploadDone(context.Context) error
 	ChatAttachmentDownloadStart(context.Context) error
 	ChatAttachmentDownloadProgress(context.Context, chat1.ChatAttachmentDownloadProgressArg) error
 	ChatAttachmentDownloadDone(context.Context) error
@@ -366,6 +379,8 @@ type ChatUI interface {
 	ChatThreadCached(context.Context, chat1.ChatThreadCachedArg) error
 	ChatThreadFull(context.Context, chat1.ChatThreadFullArg) error
 	ChatConfirmChannelDelete(context.Context, chat1.ChatConfirmChannelDeleteArg) (bool, error)
+	ChatSearchHit(context.Context, chat1.ChatSearchHitArg) error
+	ChatSearchDone(context.Context, chat1.ChatSearchDoneArg) error
 }
 
 type PromptDefault int
@@ -380,11 +395,15 @@ type PromptDescriptor int
 type OutputDescriptor int
 
 type TerminalUI interface {
+	// The ErrorWriter is not escaped: 	it should not be used to show unescaped user-originated data.
 	ErrorWriter() io.Writer
 	Output(string) error
 	OutputDesc(OutputDescriptor, string) error
 	OutputWriter() io.Writer
+	UnescapedOutputWriter() io.Writer
 	Printf(fmt string, args ...interface{}) (int, error)
+	PrintfUnescaped(fmt string, args ...interface{}) (int, error)
+	// Prompt strings are not escaped: they should not be used to show unescaped user-originated data.
 	Prompt(PromptDescriptor, string) (string, error)
 	PromptForConfirmation(prompt string) error
 	PromptPassword(PromptDescriptor, string) (string, error)
@@ -396,6 +415,7 @@ type TerminalUI interface {
 type DumbOutputUI interface {
 	Printf(fmt string, args ...interface{}) (int, error)
 	PrintfStderr(fmt string, args ...interface{}) (int, error)
+	PrintfUnescaped(fmt string, args ...interface{}) (int, error)
 }
 
 type UI interface {
@@ -497,16 +517,6 @@ type DNSContext interface {
 	GetDNSNameServerFetcher() DNSNameServerFetcher
 }
 
-// ProofContext defines features needed by the proof system
-type ProofContext interface {
-	LogContext
-	APIContext
-	NetContext
-	DNSContext
-	GetPvlSource() PvlSource
-	GetAppType() AppType
-}
-
 type AssertionContext interface {
 	NormalizeSocialName(service string, username string) (string, error)
 }
@@ -521,7 +531,7 @@ const (
 )
 
 type ProofChecker interface {
-	CheckStatus(ctx ProofContext, h SigHint, pcm ProofCheckerMode, pvlU PvlUnparsed) ProofError
+	CheckStatus(m MetaContext, h SigHint, pcm ProofCheckerMode, pvlU PvlUnparsed) ProofError
 	GetTorError() ProofError
 }
 
@@ -542,11 +552,11 @@ type ServiceType interface {
 	// leaves the dots in (that NormalizeUsername above would strip out). This
 	// lets us keep the dots in the proof text, and display them on your
 	// profile page, even though we ignore them for proof checking.
-	NormalizeRemoteName(ctx ProofContext, name string) (string, error)
+	NormalizeRemoteName(m MetaContext, name string) (string, error)
 
 	GetPrompt() string
 	LastWriterWins() bool
-	PreProofCheck(ctx ProofContext, remotename string) (*Markup, error)
+	PreProofCheck(m MetaContext, remotename string) (*Markup, error)
 	PreProofWarning(remotename string) *Markup
 	ToServiceJSON(remotename string) *jsonw.Wrapper
 	PostInstructions(remotename string) *Markup
@@ -555,7 +565,7 @@ type ServiceType interface {
 	GetProofType() string
 	GetTypeName() string
 	CheckProofText(text string, id keybase1.SigID, sig string) error
-	FormatProofText(ProofContext, *PostProofRes) (string, error)
+	FormatProofText(MetaContext, *PostProofRes) (string, error)
 	GetAPIArgKey() string
 	IsDevelOnly() bool
 
@@ -568,7 +578,7 @@ type ExternalServicesCollector interface {
 }
 
 type PvlSource interface {
-	GetPVL(ctx context.Context) (PvlUnparsed, error)
+	GetPVL(m MetaContext) (PvlUnparsed, error)
 }
 
 // UserChangedHandler is a generic interface for handling user changed events.
@@ -596,16 +606,70 @@ type ConnectivityMonitor interface {
 type TeamLoader interface {
 	VerifyTeamName(ctx context.Context, id keybase1.TeamID, name keybase1.TeamName) error
 	ImplicitAdmins(ctx context.Context, teamID keybase1.TeamID) (impAdmins []keybase1.UserVersion, err error)
-	MapIDToName(ctx context.Context, id keybase1.TeamID) (keybase1.TeamName, error)
 	NotifyTeamRename(ctx context.Context, id keybase1.TeamID, newName string) error
 	Load(context.Context, keybase1.LoadTeamArg) (*keybase1.TeamData, error)
 	// Delete the cache entry. Does not error if there is no cache entry.
 	Delete(ctx context.Context, teamID keybase1.TeamID) error
 	// Untrusted hint of what a team's latest seqno is
 	HintLatestSeqno(ctx context.Context, id keybase1.TeamID, seqno keybase1.Seqno) error
+	ResolveNameToIDUntrusted(ctx context.Context, teamName keybase1.TeamName, public bool, allowCache bool) (id keybase1.TeamID, err error)
 	OnLogout()
 	// Clear the in-memory cache. Does not affect the disk cache.
 	ClearMem()
+}
+
+type Stellar interface {
+	OnLogout()
+	CreateWalletGated(context.Context) error
+	CreateWalletSoft(context.Context)
+	Upkeep(context.Context) error
+	GetServerDefinitions(context.Context) (stellar1.StellarServerDefinitions, error)
+	KickAutoClaimRunner(MetaContext, gregor.MsgID)
+}
+
+type DeviceEKStorage interface {
+	Put(ctx context.Context, generation keybase1.EkGeneration, deviceEK keybase1.DeviceEk) error
+	Get(ctx context.Context, generation keybase1.EkGeneration) (keybase1.DeviceEk, error)
+	GetAllActive(ctx context.Context, merkleRoot MerkleRoot) ([]keybase1.DeviceEkMetadata, error)
+	MaxGeneration(ctx context.Context) (keybase1.EkGeneration, error)
+	DeleteExpired(ctx context.Context, merkleRoot MerkleRoot) ([]keybase1.EkGeneration, error)
+	ClearCache()
+	// Dangerous! Only for deprovisioning.
+	ForceDeleteAll(ctx context.Context, username NormalizedUsername) error
+	// For keybase log send
+	ListAllForUser(ctx context.Context) ([]string, error)
+}
+
+type UserEKBoxStorage interface {
+	Put(ctx context.Context, generation keybase1.EkGeneration, userEKBoxed keybase1.UserEkBoxed) error
+	Get(ctx context.Context, generation keybase1.EkGeneration) (keybase1.UserEk, error)
+	MaxGeneration(ctx context.Context) (keybase1.EkGeneration, error)
+	DeleteExpired(ctx context.Context, merkleRoot MerkleRoot) ([]keybase1.EkGeneration, error)
+	ClearCache()
+}
+
+type TeamEKBoxStorage interface {
+	Put(ctx context.Context, teamID keybase1.TeamID, generation keybase1.EkGeneration, teamEKBoxed keybase1.TeamEkBoxed) error
+	Get(ctx context.Context, teamID keybase1.TeamID, generation keybase1.EkGeneration) (keybase1.TeamEk, error)
+	MaxGeneration(ctx context.Context, teamID keybase1.TeamID) (keybase1.EkGeneration, error)
+	DeleteExpired(ctx context.Context, teamID keybase1.TeamID, merkleRoot MerkleRoot) ([]keybase1.EkGeneration, error)
+	ClearCache()
+}
+
+type EKLib interface {
+	KeygenIfNeeded(ctx context.Context) error
+	GetOrCreateLatestTeamEK(ctx context.Context, teamID keybase1.TeamID) (keybase1.TeamEk, error)
+	GetTeamEK(ctx context.Context, teamID keybase1.TeamID, generation keybase1.EkGeneration) (keybase1.TeamEk, error)
+	PurgeTeamEKGenCache(teamID keybase1.TeamID, generation keybase1.EkGeneration)
+	NewEphemeralSeed() (keybase1.Bytes32, error)
+	DeriveDeviceDHKey(seed keybase1.Bytes32) *NaclDHKeyPair
+	SignedDeviceEKStatementFromSeed(ctx context.Context, generation keybase1.EkGeneration, seed keybase1.Bytes32, signingKey GenericKey) (keybase1.DeviceEkStatement, string, error)
+	BoxLatestUserEK(ctx context.Context, receiverKey NaclDHKeyPair, deviceEKGeneration keybase1.EkGeneration) (*keybase1.UserEkBoxed, error)
+	PrepareNewUserEK(ctx context.Context, merkleRoot MerkleRoot, pukSeed PerUserKeySeed) (string, []keybase1.UserEkBoxMetadata, keybase1.UserEkMetadata, *keybase1.UserEkBoxed, error)
+	BoxLatestTeamEK(ctx context.Context, teamID keybase1.TeamID, uids []keybase1.UID) (*[]keybase1.TeamEkBoxMetadata, error)
+	PrepareNewTeamEK(ctx context.Context, teamID keybase1.TeamID, signingKey NaclSigningKeyPair, uids []keybase1.UID) (string, *[]keybase1.TeamEkBoxMetadata, keybase1.TeamEkMetadata, *keybase1.TeamEkBoxed, error)
+	// For testing
+	NewTeamEKNeeded(ctx context.Context, teamID keybase1.TeamID) (bool, error)
 }
 
 type ImplicitTeamConflictInfoCacher interface {
@@ -711,7 +775,28 @@ type ChatHelper interface {
 	SendMsgByNameNonblock(ctx context.Context, name string, topicName *string,
 		membersType chat1.ConversationMembersType, ident keybase1.TLFIdentifyBehavior, body chat1.MessageBody,
 		msgType chat1.MessageType) error
-	FindConversations(ctx context.Context, name string, topicName *string, topicType chat1.TopicType,
-		membersType chat1.ConversationMembersType, vis keybase1.TLFVisibility) ([]chat1.ConversationLocal, error)
+	FindConversations(ctx context.Context, useLocalData bool, name string, topicName *string,
+		topicType chat1.TopicType, membersType chat1.ConversationMembersType, vis keybase1.TLFVisibility) ([]chat1.ConversationLocal, error)
 	FindConversationsByID(ctx context.Context, convIDs []chat1.ConversationID) ([]chat1.ConversationLocal, error)
+	GetChannelTopicName(context.Context, keybase1.TeamID, chat1.TopicType, chat1.ConversationID) (string, error)
+	GetMessages(ctx context.Context, uid gregor1.UID, convID chat1.ConversationID,
+		msgIDs []chat1.MessageID, resolveSupersedes bool) ([]chat1.MessageUnboxed, error)
+	UpgradeKBFSToImpteam(ctx context.Context, tlfName string, tlfID chat1.TLFID, public bool) error
+	UnboxMobilePushNotification(ctx context.Context, uid gregor1.UID,
+		convID chat1.ConversationID, membersType chat1.ConversationMembersType, payload string) (string, error)
+	AckMobileNotificationSuccess(ctx context.Context, pushIDs []string)
+}
+
+// Resolver resolves human-readable usernames (joe) and user asssertions (joe+joe@github)
+// into UIDs. It is based on sever-trust. All results are unverified. So you should check
+// its answer if used in a security-sensitive setting. (See engine.ResolveAndCheck)
+type Resolver interface {
+	EnableCaching()
+	Shutdown()
+	ResolveFullExpression(ctx context.Context, input string) (res ResolveResult)
+	ResolveFullExpressionNeedUsername(ctx context.Context, input string) (res ResolveResult)
+	ResolveFullExpressionWithBody(ctx context.Context, input string) (res ResolveResult)
+	ResolveUser(ctx context.Context, assertion string) (u keybase1.User, res ResolveResult, err error)
+	ResolveWithBody(input string) ResolveResult
+	Resolve(input string) ResolveResult
 }

@@ -293,6 +293,8 @@ func (fup *folderUpdatePrepper) prepUpdateForPath(
 			refPath = *refPath.parentPath()
 		}
 		de.BlockInfo = info
+		de.PrevRevisions = de.PrevRevisions.addRevision(
+			md.Revision(), md.data.LastGCRevision)
 
 		if doSetTime {
 			if mtime {
@@ -738,7 +740,8 @@ func (fup *folderUpdatePrepper) updateResolutionUsageAndPointersLockedCache(
 	for ptr := range unmergedChains.toUnrefPointers {
 		toUnref[ptr] = true
 	}
-	deletedBlocks := make(map[BlockPointer]bool)
+	deletedRefs := make(map[BlockPointer]bool)
+	deletedUnrefs := make(map[BlockPointer]bool)
 	for ptr := range toUnref {
 		if ptr == zeroPtr || unmergedChains.doNotUnrefPointers[ptr] {
 			// A zero pointer can sneak in from the unrefs field of a
@@ -753,11 +756,12 @@ func (fup *folderUpdatePrepper) updateResolutionUsageAndPointersLockedCache(
 		}
 		if isUnflushed {
 			blocksToDelete = append(blocksToDelete, ptr.ID)
-			deletedBlocks[ptr] = true
+			deletedUnrefs[ptr] = true
 			// No need to unreference this since we haven't flushed it yet.
 			continue
 		}
 
+		deletedRefs[ptr] = true
 		// Put the unrefs in a new resOp after the final operation, to
 		// cancel out any stray refs in earlier ops.
 		fup.log.CDebugf(ctx, "Unreferencing dropped block %v", ptr)
@@ -765,18 +769,32 @@ func (fup *folderUpdatePrepper) updateResolutionUsageAndPointersLockedCache(
 			md.data.Changes.Ops, ptr, unmergedChains.doNotUnrefPointers)
 	}
 
-	// Scrub all unrefs of blocks that never made it to the server,
-	// for smaller updates and to make things easier on the
-	// StateChecker.
-	if len(deletedBlocks) > 0 {
+	// Scrub all refs and unrefs of blocks that never made it to the
+	// server, for smaller updates and to make things easier on the
+	// StateChecker.  We scrub the refs too because in some cases
+	// (e.g., on a copied conflict file), we add an unref without
+	// removing the original ref, and if we remove the unref, the ref
+	// must go too.
+	if len(deletedRefs) > 0 || len(deletedUnrefs) > 0 {
 		for _, op := range md.data.Changes.Ops {
-			var toUnref []BlockPointer
-			for _, unref := range op.Unrefs() {
-				if deletedBlocks[unref] {
-					toUnref = append(toUnref, unref)
+			var toDelRef []BlockPointer
+			for _, ref := range op.Refs() {
+				if deletedRefs[ref] || deletedUnrefs[ref] {
+					toDelRef = append(toDelRef, ref)
 				}
 			}
-			for _, unref := range toUnref {
+			for _, ref := range toDelRef {
+				fup.log.CDebugf(ctx, "Scrubbing ref %v", ref)
+				op.DelRefBlock(ref)
+			}
+			var toDelUnref []BlockPointer
+			for _, unref := range op.Unrefs() {
+				if deletedUnrefs[unref] {
+					toDelUnref = append(toDelUnref, unref)
+				}
+			}
+			for _, unref := range toDelUnref {
+				fup.log.CDebugf(ctx, "Scrubbing unref %v", unref)
 				op.DelUnrefBlock(unref)
 			}
 		}

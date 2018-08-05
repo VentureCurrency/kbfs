@@ -34,7 +34,7 @@ type WriterMetadataV3 struct {
 	// Writers identified by unresolved social assertions.
 	UnresolvedWriters []keybase1.SocialAssertion `codec:"uw,omitempty"`
 	// Pointer to the writer key bundle for private TLFs.
-	WKeyBundleID TLFWriterKeyBundleID `codec:"wkid,omitempty"`
+	WKeyBundleID TLFWriterKeyBundleID `codec:"wkid"`
 	// Latest key generation.
 	LatestKeyGen KeyGen `codec:"lkg"`
 
@@ -78,7 +78,7 @@ type RootMetadataV3 struct {
 	// For private TLFs. Any unresolved social assertions for readers.
 	UnresolvedReaders []keybase1.SocialAssertion `codec:"ur,omitempty"`
 	// Pointer to the reader key bundle for private TLFs.
-	RKeyBundleID TLFReaderKeyBundleID `codec:"rkid,omitempty"`
+	RKeyBundleID TLFReaderKeyBundleID `codec:"rkid"`
 
 	// ConflictInfo is set if there's a conflict for the given folder's
 	// handle after a social assertion resolution.
@@ -979,8 +979,6 @@ func (md *RootMetadataV3) IsValidAndSigned(
 			return err
 		}
 
-		// TODO: Eventually this will have to use a Merkle sequence
-		// number to check historic versions.
 		isWriter, err = teamMemChecker.IsTeamWriter(
 			ctx, tid, writer, writerVerifyingKey)
 		if err != nil {
@@ -1424,6 +1422,13 @@ func (md *RootMetadataV3) SetFinalizedInfo(fi *tlf.HandleExtension) {
 // SetWriters implements the MutableRootMetadata interface for RootMetadataV3.
 func (md *RootMetadataV3) SetWriters(writers []keybase1.UserOrTeamID) {
 	md.WriterMetadata.Writers = writers
+}
+
+// ClearForV4Migration implements the MutableRootMetadata interface
+// for RootMetadataV3.
+func (md *RootMetadataV3) ClearForV4Migration() {
+	md.WriterMetadata.WKeyBundleID = TLFWriterKeyBundleID{}
+	md.RKeyBundleID = TLFReaderKeyBundleID{}
 }
 
 // SetTlfID implements the MutableRootMetadata interface for RootMetadataV3.

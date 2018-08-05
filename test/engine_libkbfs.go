@@ -16,8 +16,10 @@ import (
 	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/kbfs/ioutil"
 	"github.com/keybase/kbfs/kbfsmd"
+	"github.com/keybase/kbfs/libfs"
 	"github.com/keybase/kbfs/libkbfs"
 	"github.com/keybase/kbfs/tlf"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -205,7 +207,7 @@ func parseTlfHandle(
 outer:
 	for i := 0; i < 2; i++ {
 		h, err = libkbfs.ParseTlfHandle(ctx, kbpki, mdOps, tlfName, t)
-		switch err := err.(type) {
+		switch err := errors.Cause(err).(type) {
 		case nil:
 			break outer
 		case libkbfs.TlfNameNotCanonical:
@@ -239,9 +241,9 @@ func (k *LibKBFS) GetFavorites(u User, t tlf.Type) (map[string]bool, error) {
 	return favoritesMap, nil
 }
 
-// GetRootDir implements the Engine interface.
-func (k *LibKBFS) GetRootDir(u User, tlfName string, t tlf.Type, expectedCanonicalTlfName string) (
-	dir Node, err error) {
+func (k *LibKBFS) getRootDir(
+	u User, tlfName string, t tlf.Type, branch libkbfs.BranchName,
+	expectedCanonicalTlfName string) (dir Node, err error) {
 	config := u.(*libkbfs.ConfigLocal)
 
 	ctx, cancel := k.newContext(u)
@@ -256,13 +258,75 @@ func (k *LibKBFS) GetRootDir(u User, tlfName string, t tlf.Type, expectedCanonic
 			expectedCanonicalTlfName, h.GetCanonicalName())
 	}
 
-	dir, _, err = config.KBFSOps().GetOrCreateRootNode(
-		ctx, h, libkbfs.MasterBranch)
+	if branch == libkbfs.MasterBranch {
+		dir, _, err = config.KBFSOps().GetOrCreateRootNode(ctx, h, branch)
+	} else {
+		dir, _, err = config.KBFSOps().GetRootNode(ctx, h, branch)
+	}
 	if err != nil {
 		return nil, err
 	}
+
 	k.refs[config][dir.(libkbfs.Node)] = true
 	return dir, nil
+}
+
+// GetRootDir implements the Engine interface.
+func (k *LibKBFS) GetRootDir(
+	u User, tlfName string, t tlf.Type, expectedCanonicalTlfName string) (
+	dir Node, err error) {
+	return k.getRootDir(
+		u, tlfName, t, libkbfs.MasterBranch, expectedCanonicalTlfName)
+}
+
+// GetRootDirAtRevision implements the Engine interface.
+func (k *LibKBFS) GetRootDirAtRevision(
+	u User, tlfName string, t tlf.Type, rev kbfsmd.Revision,
+	expectedCanonicalTlfName string) (dir Node, err error) {
+	return k.getRootDir(
+		u, tlfName, t, libkbfs.MakeRevBranchName(rev), expectedCanonicalTlfName)
+}
+
+// GetRootDirAtTimeString implements the Engine interface.
+func (k *LibKBFS) GetRootDirAtTimeString(
+	u User, tlfName string, t tlf.Type, timeString string,
+	expectedCanonicalTlfName string) (dir Node, err error) {
+	config := u.(*libkbfs.ConfigLocal)
+	ctx, cancel := k.newContext(u)
+	defer cancel()
+	h, err := parseTlfHandle(ctx, config.KBPKI(), config.MDOps(), tlfName, t)
+	if err != nil {
+		return nil, err
+	}
+
+	rev, err := libfs.RevFromTimeString(ctx, config, h, timeString)
+	if err != nil {
+		return nil, err
+	}
+
+	return k.getRootDir(
+		u, tlfName, t, libkbfs.MakeRevBranchName(rev), expectedCanonicalTlfName)
+}
+
+// GetRootDirAtRelTimeString implements the Engine interface.
+func (k *LibKBFS) GetRootDirAtRelTimeString(
+	u User, tlfName string, t tlf.Type, relTimeString string,
+	expectedCanonicalTlfName string) (dir Node, err error) {
+	config := u.(*libkbfs.ConfigLocal)
+	ctx, cancel := k.newContext(u)
+	defer cancel()
+	h, err := parseTlfHandle(ctx, config.KBPKI(), config.MDOps(), tlfName, t)
+	if err != nil {
+		return nil, err
+	}
+
+	rev, err := libfs.RevFromRelativeTimeString(ctx, config, h, relTimeString)
+	if err != nil {
+		return nil, err
+	}
+
+	return k.getRootDir(
+		u, tlfName, t, libkbfs.MakeRevBranchName(rev), expectedCanonicalTlfName)
 }
 
 // CreateDir implements the Engine interface.
@@ -487,6 +551,27 @@ func (k *LibKBFS) GetMtime(u User, file Node) (mtime time.Time, err error) {
 		return time.Time{}, err
 	}
 	return time.Unix(0, info.Mtime), nil
+}
+
+// GetPrevRevisions implements the Engine interface.
+func (k *LibKBFS) GetPrevRevisions(u User, file Node) (
+	revs libkbfs.PrevRevisions, err error) {
+	config := u.(*libkbfs.ConfigLocal)
+	kbfsOps := config.KBFSOps()
+	var info libkbfs.EntryInfo
+	ctx, cancel := k.newContext(u)
+	defer cancel()
+	if node, ok := file.(libkbfs.Node); ok {
+		info, err = kbfsOps.Stat(ctx, node)
+	} else if node, ok := file.(libkbfsSymNode); ok {
+		// Stat doesn't work for symlinks, so use lookup
+		_, info, err = kbfsOps.Lookup(ctx, node.parentDir.(libkbfs.Node),
+			node.name)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return info.PrevRevisions, nil
 }
 
 // getRootNode is like GetRootDir, but doesn't check the canonical TLF
@@ -735,6 +820,23 @@ func (k *LibKBFS) UnflushedPaths(u User, tlfName string, t tlf.Type) (
 	}
 
 	return status.Journal.UnflushedPaths, nil
+}
+
+// UserEditHistory implements the Engine interface.
+func (k *LibKBFS) UserEditHistory(u User) (
+	[]keybase1.FSFolderEditHistory, error) {
+	config := u.(*libkbfs.ConfigLocal)
+
+	ctx, cancel := k.newContext(u)
+	defer cancel()
+	session, err := libkbfs.GetCurrentSessionIfPossible(
+		ctx, config.KBPKI(), true)
+	if err != nil {
+		return nil, err
+	}
+
+	history := config.UserHistory().Get(string(session.Name))
+	return history, nil
 }
 
 // DirtyPaths implements the Engine interface.

@@ -28,8 +28,8 @@ func NewFacebookChecker(p libkb.RemoteProofChainLink) (*FacebookChecker, libkb.P
 
 func (rc *FacebookChecker) GetTorError() libkb.ProofError { return nil }
 
-func (rc *FacebookChecker) CheckStatus(ctx libkb.ProofContext, h libkb.SigHint, _ libkb.ProofCheckerMode, pvlU libkb.PvlUnparsed) libkb.ProofError {
-	return CheckProofPvl(ctx, keybase1.ProofType_FACEBOOK, rc.proof, h, pvlU)
+func (rc *FacebookChecker) CheckStatus(m libkb.MetaContext, h libkb.SigHint, _ libkb.ProofCheckerMode, pvlU libkb.PvlUnparsed) libkb.ProofError {
+	return CheckProofPvl(m, keybase1.ProofType_FACEBOOK, rc.proof, h, pvlU)
 }
 
 //
@@ -45,11 +45,12 @@ func (t FacebookServiceType) NormalizeUsername(s string) (string, error) {
 	if !facebookUsernameRegexp.MatchString(s) {
 		return "", libkb.NewBadUsernameError(s)
 	}
-	// Convert to lowercase and strip out dots.
-	return strings.ToLower(strings.Replace(s, ".", "", -1)), nil
+	// Convert to lowercase. Don't strip out dots, because while Facebook makes
+	// them optional, there are still dots in a user's "canonical" account name.
+	return strings.ToLower(s), nil
 }
 
-func (t FacebookServiceType) NormalizeRemoteName(ctx libkb.ProofContext, s string) (string, error) {
+func (t FacebookServiceType) NormalizeRemoteName(m libkb.MetaContext, s string) (string, error) {
 	// Allow a leading '@'.
 	s = strings.TrimPrefix(s, "@")
 	if !facebookUsernameRegexp.MatchString(s) {

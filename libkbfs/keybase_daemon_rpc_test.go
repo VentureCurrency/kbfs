@@ -103,18 +103,21 @@ func (c *fakeKeybaseClient) Call(ctx context.Context, s string, args interface{}
 		c.identifyCalled = true
 		return nil
 
-	case "keybase.1.user.loadUserPlusKeys":
-		arg := args.([]interface{})[0].(keybase1.LoadUserPlusKeysArg)
+	case "keybase.1.user.loadUserPlusKeysV2":
+		arg := args.([]interface{})[0].(keybase1.LoadUserPlusKeysV2Arg)
 
 		userInfo, ok := c.users[arg.Uid]
 		if !ok {
 			return fmt.Errorf("Could not find user info for UID %s", arg.Uid)
 		}
 
-		*res.(*keybase1.UserPlusKeys) = keybase1.UserPlusKeys{
-			Uid:      arg.Uid,
-			Username: string(userInfo.Name),
-		}
+		*res.(*keybase1.UserPlusKeysV2AllIncarnations) =
+			keybase1.UserPlusKeysV2AllIncarnations{
+				Current: keybase1.UserPlusKeysV2{
+					Uid:      arg.Uid,
+					Username: string(userInfo.Name),
+				},
+			}
 
 		c.loadUserPlusKeysCalled = true
 		return nil
@@ -211,21 +214,6 @@ func testLoadUserPlusKeys(
 	assert.Equal(t, expectedCalled, client.loadUserPlusKeysCalled)
 }
 
-func testLoadUnverifiedKeys(
-	t *testing.T, client *fakeKeybaseClient, c *KeybaseDaemonRPC,
-	uid keybase1.UID, expectedName libkb.NormalizedUsername,
-	expectedCalled bool) {
-	client.loadAllPublicKeysUnverified = false
-
-	ctx := context.Background()
-	keys, err := c.LoadUnverifiedKeys(ctx, uid)
-	require.NoError(t, err)
-
-	assert.Equal(t, 1, len(keys))
-	assert.Equal(t, keys[0].KID, kbfscrypto.MakeFakeVerifyingKeyOrBust("foo").KID())
-	assert.Equal(t, expectedCalled, client.loadAllPublicKeysUnverified)
-}
-
 func testIdentify(
 	t *testing.T, client *fakeKeybaseClient, c *KeybaseDaemonRPC,
 	uid keybase1.UID, expectedName libkb.NormalizedUsername,
@@ -272,18 +260,6 @@ func TestKeybaseDaemonUserCache(t *testing.T) {
 	// Should not be cached.
 	testIdentify(t, client, c, uid2, name2, expectCall)
 
-	// Should fill cache.
-	testLoadUnverifiedKeys(t, client, c, uid1, name1, expectCall)
-
-	// Should be cached.
-	testLoadUnverifiedKeys(t, client, c, uid1, name1, expectCached)
-
-	// Should fill cache.
-	testLoadUnverifiedKeys(t, client, c, uid2, name2, expectCall)
-
-	// Should be cached.
-	testLoadUnverifiedKeys(t, client, c, uid2, name2, expectCached)
-
 	// Should invalidate cache for uid1.
 	err := c.KeyfamilyChanged(context.Background(), uid1)
 	require.NoError(t, err)
@@ -293,18 +269,6 @@ func TestKeybaseDaemonUserCache(t *testing.T) {
 
 	// Should be cached again.
 	testLoadUserPlusKeys(t, client, c, uid1, name1, expectCached)
-
-	// Should fill cache again.
-	testLoadUnverifiedKeys(t, client, c, uid1, name1, expectCall)
-
-	// Should still be cached.
-	testLoadUnverifiedKeys(t, client, c, uid1, name1, expectCached)
-
-	// Should still be cached.
-	testLoadUserPlusKeys(t, client, c, uid2, name2, expectCached)
-
-	// Should still be cached.
-	testLoadUnverifiedKeys(t, client, c, uid2, name2, expectCached)
 
 	// Should invalidate cache for uid2.
 	err = c.KeyfamilyChanged(context.Background(), uid2)
@@ -316,20 +280,12 @@ func TestKeybaseDaemonUserCache(t *testing.T) {
 	// Should be cached again.
 	testLoadUserPlusKeys(t, client, c, uid2, name2, expectCached)
 
-	// Should fill cache again.
-	testLoadUnverifiedKeys(t, client, c, uid2, name2, expectCall)
-
-	// Should still be cached.
-	testLoadUnverifiedKeys(t, client, c, uid2, name2, expectCached)
-
 	// Should invalidate cache for all users.
 	c.OnDisconnected(context.Background(), rpc.UsingExistingConnection)
 
 	// Should fill cache again.
 	testLoadUserPlusKeys(t, client, c, uid1, name1, expectCall)
 	testLoadUserPlusKeys(t, client, c, uid2, name2, expectCall)
-	testLoadUnverifiedKeys(t, client, c, uid1, name1, expectCall)
-	testLoadUnverifiedKeys(t, client, c, uid2, name2, expectCall)
 
 	// Test that CheckForRekey gets called only if the logged-in user
 	// changes.
@@ -379,8 +335,10 @@ func TestKeybaseDaemonRPCEditList(t *testing.T) {
 	var userName1, userName2 libkb.NormalizedUsername = "u1", "u2"
 	config1, _, ctx, cancel := kbfsOpsConcurInit(t, userName1, userName2)
 	defer kbfsConcurTestShutdown(t, config1, ctx, cancel)
+	// kbfsOpsConcurInit turns off notifications, so turn them back on.
+	config1.mode = modeTest{NewInitModeFromType(InitDefault)}
 
-	clock, now := newTestClockAndTimeNow()
+	clock, first := newTestClockAndTimeNow()
 	config1.SetClock(clock)
 
 	config2 := ConfigAsUser(config1, userName2)
@@ -399,17 +357,20 @@ func TestKeybaseDaemonRPCEditList(t *testing.T) {
 	require.NoError(t, err)
 
 	kbfsOps2 := config2.KBFSOps()
-	err = kbfsOps2.SyncFromServer(ctx,
-		rootNode2.GetFolderBranch(), nil)
+	err = kbfsOps2.SyncFromServer(ctx, rootNode2.GetFolderBranch(), nil)
 	require.NoError(t, err)
+
+	clock.Add(1 * time.Minute)
+	second := clock.Now()
 
 	_, _, err = kbfsOps2.CreateFile(ctx, rootNode2, "b", false, NoExcl)
 	require.NoError(t, err)
 	err = kbfsOps2.SyncAll(ctx, rootNode2.GetFolderBranch())
 	require.NoError(t, err)
 
-	err = kbfsOps1.SyncFromServer(ctx,
-		rootNode1.GetFolderBranch(), nil)
+	err = kbfsOps2.SyncFromServer(ctx, rootNode2.GetFolderBranch(), nil)
+	require.NoError(t, err)
+	err = kbfsOps1.SyncFromServer(ctx, rootNode1.GetFolderBranch(), nil)
 	require.NoError(t, err)
 
 	session1, err := config1.KBPKI().GetCurrentSession(context.Background())
@@ -420,20 +381,30 @@ func TestKeybaseDaemonRPCEditList(t *testing.T) {
 	uid2 := session2.UID
 
 	// We should see 1 create edit for each user.
-	expectedEdits := []keybase1.FSNotification{
-		{
-			Filename:         name + "/a",
-			StatusCode:       keybase1.FSStatusCode_FINISH,
-			NotificationType: keybase1.FSNotificationType_FILE_CREATED,
-			WriterUid:        uid1,
-			LocalTime:        keybase1.ToTime(now),
+	expectedHistory := keybase1.FSFolderEditHistory{
+		Folder: keybase1.Folder{
+			Name:       name,
+			FolderType: keybase1.FolderType_PRIVATE,
+			Private:    true,
 		},
-		{
-			Filename:         name + "/b",
-			StatusCode:       keybase1.FSStatusCode_FINISH,
-			NotificationType: keybase1.FSNotificationType_FILE_CREATED,
-			WriterUid:        uid2,
-			LocalTime:        keybase1.ToTime(now),
+		ServerTime: keybase1.ToTime(second),
+		History: []keybase1.FSFolderWriterEditHistory{
+			{
+				WriterName: "u2",
+				Edits: []keybase1.FSFolderWriterEdit{{
+					Filename:         "/keybase/private/u1,u2/b",
+					NotificationType: keybase1.FSNotificationType_FILE_MODIFIED,
+					ServerTime:       keybase1.ToTime(second),
+				}},
+			},
+			{
+				WriterName: "u1",
+				Edits: []keybase1.FSFolderWriterEdit{{
+					Filename:         "/keybase/private/u1,u2/a",
+					NotificationType: keybase1.FSNotificationType_FILE_MODIFIED,
+					ServerTime:       keybase1.ToTime(first),
+				}},
+			},
 		},
 	}
 
@@ -452,14 +423,6 @@ func TestKeybaseDaemonRPCEditList(t *testing.T) {
 		RequestID: reqID,
 	})
 	require.NoError(t, err)
-	edits := client1.editResponse.Edits
-	require.Len(t, edits, 2)
-	// Order doesn't matter between writers, so swap them.
-	if edits[0].WriterUid == uid2 {
-		edits[0], edits[1] = edits[1], edits[0]
-	}
-
-	require.Equal(t, truncateNotificationTimestamps(expectedEdits),
-		truncateNotificationTimestamps(edits),
-		"User1 has unexpected edit history")
+	history := client1.editResponse.Edits
+	require.Equal(t, expectedHistory, history)
 }

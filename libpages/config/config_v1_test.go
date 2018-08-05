@@ -5,10 +5,12 @@
 package config
 
 import (
+	"bytes"
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"golang.org/x/crypto/bcrypt"
 )
 
 func TestConfigV1Default(t *testing.T) {
@@ -86,25 +88,14 @@ func TestConfigV1Invalid(t *testing.T) {
 	require.IsType(t, ErrInvalidPermissions{}, err)
 }
 
-func generatePasswordHashForTestOrBust(t *testing.T, password string) []byte {
-	passwordHash, err := bcrypt.GenerateFromPassword(
-		[]byte(password), bcrypt.MinCost)
-	require.NoError(t, err)
-	return passwordHash
-}
-
-func stringPtr(str string) *string {
-	return &str
-}
-
 func TestConfigV1Full(t *testing.T) {
 	config := V1{
 		Common: Common{
 			Version: Version1Str,
 		},
 		Users: map[string]string{
-			"alice": string(generatePasswordHashForTestOrBust(t, "12345")),
-			"bob":   string(generatePasswordHashForTestOrBust(t, "54321")),
+			"alice": string(generateBcryptPasswordHashForTestOrBust(t, "12345")),
+			"bob":   string(generateSHA256PasswordHashForTestOrBust(t, "54321")),
 		},
 		ACLs: map[string]AccessControlV1{
 			"/": AccessControlV1{
@@ -135,7 +126,15 @@ func TestConfigV1Full(t *testing.T) {
 		},
 	}
 
-	authenticated := config.Authenticate("alice", "12345")
+	ctx := context.Background()
+
+	authenticated := config.Authenticate(ctx, "alice", "54321")
+	require.False(t, authenticated)
+	authenticated = config.Authenticate(ctx, "bob", "12345")
+	require.False(t, authenticated)
+	authenticated = config.Authenticate(ctx, "alice", "12345")
+	require.True(t, authenticated)
+	authenticated = config.Authenticate(ctx, "bob", "54321")
 	require.True(t, authenticated)
 
 	read, list, possibleRead, possibleList,
@@ -337,4 +336,19 @@ func TestConfigV1Full(t *testing.T) {
 	require.False(t, possibleRead)
 	require.False(t, possibleList)
 	require.Equal(t, "/bob/dir/deep-dir/deep-deep-dir", realm)
+}
+
+func TestV1EncodeObjectKeyOrder(t *testing.T) {
+	// We are relying on an undocumented feature of encoding/json where struct
+	// fields are serialized into json with the same order that they are
+	// defined in the struct. If this ever changes in the future, this test
+	// helps us catch it.
+	v1 := DefaultV1()
+	buf := &bytes.Buffer{}
+	err := v1.Encode(buf, false)
+	require.NoError(t, err)
+	const expectedJSON = `{"version":"v1","users":null,` +
+		`"acls":{"/":{"whitelist_additional_permissions":null,` +
+		`"anonymous_permissions":"read,list"}}}`
+	require.Equal(t, expectedJSON, strings.TrimSpace(buf.String()))
 }

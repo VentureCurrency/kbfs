@@ -7,6 +7,7 @@ package libkbfs
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/keybase/kbfs/kbfsmd"
 	kbgitkbfs "github.com/keybase/kbfs/protocol/kbgitkbfs1"
 	"github.com/keybase/kbfs/tlf"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -29,6 +31,18 @@ const (
 // user-created directory entry name.
 var disallowedPrefixes = [...]string{".kbfs"}
 
+type revokedKeyInfo struct {
+	// Fields are exported so they can be copied by the codec.
+	Time       keybase1.Time
+	MerkleRoot keybase1.MerkleRootV2
+
+	// These fields never need copying.
+	sigChainLocation keybase1.SigChainLocation
+	resetSeqno       keybase1.Seqno
+	isReset          bool
+	filledInMerkle   bool
+}
+
 // UserInfo contains all the info about a keybase user that kbfs cares
 // about.
 type UserInfo struct {
@@ -40,8 +54,8 @@ type UserInfo struct {
 	EldestSeqno     keybase1.Seqno
 
 	// Revoked keys, and the time at which they were revoked.
-	RevokedVerifyingKeys   map[kbfscrypto.VerifyingKey]keybase1.KeybaseTime
-	RevokedCryptPublicKeys map[kbfscrypto.CryptPublicKey]keybase1.KeybaseTime
+	RevokedVerifyingKeys   map[kbfscrypto.VerifyingKey]revokedKeyInfo
+	RevokedCryptPublicKeys map[kbfscrypto.CryptPublicKey]revokedKeyInfo
 }
 
 // TeamInfo contains all the info about a keybase team that kbfs cares
@@ -60,8 +74,9 @@ type TeamInfo struct {
 	Writers map[keybase1.UID]bool
 	Readers map[keybase1.UID]bool
 
-	// TODO: Should we add a historic membership log to easily check
-	// whether a user was a member given some Merkle seqno?
+	// Last writers map a KID to the last time the writer associated
+	// with that KID trasitioned from writer to non-writer.
+	LastWriters map[kbfscrypto.VerifyingKey]keybase1.MerkleRootV2
 }
 
 // ImplicitTeamInfo contains information needed after
@@ -351,7 +366,30 @@ const (
 	// folder.  Set to the empty string so that the default will be
 	// the master branch.
 	MasterBranch BranchName = ""
+
+	branchRevPrefix = "rev="
 )
+
+// MakeRevBranchName returns a branch name specifying an archive
+// branch pinned to the given revision number.
+func MakeRevBranchName(rev kbfsmd.Revision) BranchName {
+	return BranchName(branchRevPrefix + strconv.FormatInt(int64(rev), 10))
+}
+
+// RevisionIfSpecified returns a valid revision number and true if
+// `bn` is a revision branch.
+func (bn BranchName) RevisionIfSpecified() (kbfsmd.Revision, bool) {
+	if !strings.HasPrefix(string(bn), branchRevPrefix) {
+		return kbfsmd.RevisionUninitialized, false
+	}
+
+	i, err := strconv.ParseInt(string(bn[len(branchRevPrefix):]), 10, 64)
+	if err != nil {
+		return kbfsmd.RevisionUninitialized, false
+	}
+
+	return kbfsmd.Revision(i), true
+}
 
 // FolderBranch represents a unique pair of top-level folder and a
 // branch of that folder.
@@ -384,7 +422,15 @@ func (fb FolderBranch) String() string {
 type BlockChanges struct {
 	// If this is set, the actual changes are stored in a block (where
 	// the block contains a serialized version of BlockChanges)
-	Info BlockInfo `codec:"p,omitempty"`
+	//
+	// Ideally, we'd omit Info if it's empty. However, old clients
+	// rely on encoded BlockChanges always having an encoded Info,
+	// so that decoding into an existing BlockChanges object
+	// clobbers any existing Info, so we can't omit Info until all
+	// clients have upgraded to a version that explicitly clears
+	// Info on decode, and we've verified that there's nothing
+	// else that relies on Info always being filled.
+	Info BlockInfo `codec:"p"`
 	// An ordered list of operations completed in this update
 	Ops opsList `codec:"o,omitempty"`
 	// Estimate the number of bytes that this set of changes will take to encode
@@ -526,6 +572,38 @@ type EntryInfo struct {
 	// If this is a team TLF, we want to track the last writer of an
 	// entry, since in the block, only the team ID will be tracked.
 	TeamWriter keybase1.UID `codec:"tw,omitempty"`
+	// Tracks a skiplist of the previous revisions for this entry.
+	PrevRevisions PrevRevisions `codec:"pr,omitempty"`
+}
+
+func init() {
+	if reflect.ValueOf(EntryInfo{}).NumField() != 7 {
+		panic(errors.New(
+			"Unexpected number of fields in EntryInfo; " +
+				"please update EntryInfo.Eq() for your " +
+				"new or removed field"))
+	}
+}
+
+// Eq returns true if `other` is equal to `ei`.
+func (ei EntryInfo) Eq(other EntryInfo) bool {
+	eq := ei.Type == other.Type &&
+		ei.Size == other.Size &&
+		ei.SymPath == other.SymPath &&
+		ei.Mtime == other.Mtime &&
+		ei.Ctime == other.Ctime &&
+		ei.TeamWriter == other.TeamWriter &&
+		len(ei.PrevRevisions) == len(other.PrevRevisions)
+	if !eq {
+		return false
+	}
+	for i, pr := range ei.PrevRevisions {
+		otherPR := other.PrevRevisions[i]
+		if pr.Revision != otherPR.Revision || pr.Count != otherPR.Count {
+			return false
+		}
+	}
+	return true
 }
 
 // ReportedError represents an error reported by KBFS.
@@ -580,33 +658,6 @@ const (
 	WriteMode
 )
 
-// UserInfoFromProtocol returns UserInfo from UserPlusKeys
-func UserInfoFromProtocol(upk keybase1.UserPlusKeys) (UserInfo, error) {
-	verifyingKeys, cryptPublicKeys, kidNames, err := filterKeys(upk.DeviceKeys)
-	if err != nil {
-		return UserInfo{}, err
-	}
-
-	revokedVerifyingKeys, revokedCryptPublicKeys, revokedKidNames, err := filterRevokedKeys(upk.RevokedDeviceKeys)
-	if err != nil {
-		return UserInfo{}, err
-	}
-
-	for k, v := range revokedKidNames {
-		kidNames[k] = v
-	}
-
-	return UserInfo{
-		Name:                   libkb.NewNormalizedUsername(upk.Username),
-		UID:                    upk.Uid,
-		VerifyingKeys:          verifyingKeys,
-		CryptPublicKeys:        cryptPublicKeys,
-		KIDNames:               kidNames,
-		RevokedVerifyingKeys:   revokedVerifyingKeys,
-		RevokedCryptPublicKeys: revokedCryptPublicKeys,
-	}, nil
-}
-
 // SessionInfoFromProtocol returns SessionInfo from Session
 func SessionInfoFromProtocol(session keybase1.Session) (SessionInfo, error) {
 	// Import the KIDs to validate them.
@@ -660,18 +711,13 @@ type RekeyResult struct {
 	NeedsPaperKey bool
 }
 
-// InitMode indicates how KBFS should configure itself at runtime.
-type InitMode int
+// InitModeType indicates how KBFS should configure itself at runtime.
+type InitModeType int
 
 const (
-	// InitModeMask masks out mode flags.
-	InitModeMask InitMode = 0xffff
-	// InitTest is a mode flag that represents whether we're running in a test.
-	InitTest InitMode = 1 << 16
-
 	// InitDefault is the normal mode for when KBFS data will be read
 	// and written.
-	InitDefault InitMode = iota
+	InitDefault InitModeType = iota
 	// InitMinimal is for when KBFS will only be used as a MD lookup
 	// layer (e.g., for chat on mobile).
 	InitMinimal
@@ -680,26 +726,21 @@ const (
 	// needed, and some naming restrictions are lifted (e.g., `.kbfs_`
 	// filenames are allowed).
 	InitSingleOp
+	// InitConstrained is a mode where KBFS reads and writes data, but
+	// constrains itself to using fewer resources (e.g. on mobile).
+	InitConstrained
 )
 
-// Mode returns the mode absent any mode flags.
-func (im InitMode) Mode() InitMode {
-	return im & InitModeMask
-}
-
-// HasFlags returns whether all the specified flags are set.
-func (im InitMode) HasFlags(flags InitMode) bool {
-	return im&flags > 0
-}
-
-func (im InitMode) String() string {
-	switch im.Mode() {
+func (im InitModeType) String() string {
+	switch im {
 	case InitDefault:
 		return InitDefaultString
 	case InitMinimal:
 		return InitMinimalString
 	case InitSingleOp:
 		return InitSingleOpString
+	case InitConstrained:
+		return InitConstrainedString
 	default:
 		return "unknown"
 	}

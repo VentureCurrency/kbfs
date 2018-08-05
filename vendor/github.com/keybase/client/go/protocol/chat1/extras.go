@@ -6,14 +6,21 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/keybase/client/go/protocol/gregor1"
 	"github.com/keybase/client/go/protocol/keybase1"
 )
 
+// we will show some representation of an exploded message in the UI for a week
+const ShowExplosionLifetime = time.Hour * 24 * 7
+
 type ByUID []gregor1.UID
+type ConvIDShort = []byte
 
 func (b ByUID) Len() int      { return len(b) }
 func (b ByUID) Swap(i, j int) { b[i], b[j] = b[j], b[i] }
@@ -68,8 +75,20 @@ const DbShortFormLen = 10
 
 // DbShortForm should only be used when interacting with the database, and should
 // never leave Gregor
-func (cid ConversationID) DbShortForm() []byte {
+func (cid ConversationID) DbShortForm() ConvIDShort {
 	return cid[:DbShortFormLen]
+}
+
+func (cid ConversationID) DbShortFormString() string {
+	return DbShortFormToString(cid.DbShortForm())
+}
+
+func DbShortFormToString(cid ConvIDShort) string {
+	return hex.EncodeToString(cid)
+}
+
+func DbShortFormFromString(cid string) (ConvIDShort, error) {
+	return hex.DecodeString(cid)
 }
 
 func MakeTLFID(val string) (TLFID, error) {
@@ -88,6 +107,13 @@ func (mid MessageID) String() string {
 	return strconv.FormatUint(uint64(mid), 10)
 }
 
+func (mid MessageID) Min(mid2 MessageID) MessageID {
+	if mid < mid2 {
+		return mid
+	}
+	return mid2
+}
+
 func (t MessageType) String() string {
 	s, ok := MessageTypeRevMap[t]
 	if ok {
@@ -102,6 +128,7 @@ var deletableMessageTypesByDelete = []MessageType{
 	MessageType_ATTACHMENT,
 	MessageType_EDIT,
 	MessageType_ATTACHMENTUPLOADED,
+	MessageType_REACTION,
 }
 
 // Messages types NOT deletable by a DELETEHISTORY message.
@@ -128,6 +155,9 @@ func DeletableMessageTypesByDeleteHistory() (res []MessageType) {
 			res = append(res, mt)
 		}
 	}
+	sort.Slice(res, func(i, j int) bool {
+		return res[i] < res[j]
+	})
 	return res
 }
 
@@ -175,16 +205,37 @@ func (hash Hash) Eq(other Hash) bool {
 	return bytes.Equal(hash, other)
 }
 
+func (m MessageUnboxed) OutboxID() *OutboxID {
+	if state, err := m.State(); err == nil {
+		switch state {
+		case MessageUnboxedState_VALID:
+			return m.Valid().ClientHeader.OutboxID
+		case MessageUnboxedState_ERROR:
+			return nil
+		case MessageUnboxedState_PLACEHOLDER:
+			return nil
+		case MessageUnboxedState_OUTBOX:
+			return m.Outbox().Msg.ClientHeader.OutboxID
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 func (m MessageUnboxed) GetMessageID() MessageID {
 	if state, err := m.State(); err == nil {
-		if state == MessageUnboxedState_VALID {
+		switch state {
+		case MessageUnboxedState_VALID:
 			return m.Valid().ServerHeader.MessageID
-		}
-		if state == MessageUnboxedState_ERROR {
+		case MessageUnboxedState_ERROR:
 			return m.Error().MessageID
-		}
-		if state == MessageUnboxedState_PLACEHOLDER {
+		case MessageUnboxedState_PLACEHOLDER:
 			return m.Placeholder().MessageID
+		case MessageUnboxedState_OUTBOX:
+			return m.Outbox().Msg.ClientHeader.OutboxInfo.Prev
+		default:
+			return 0
 		}
 	}
 	return 0
@@ -217,6 +268,180 @@ func (m MessageUnboxed) IsValid() bool {
 	return false
 }
 
+func (m MessageUnboxed) IsError() bool {
+	if state, err := m.State(); err == nil {
+		return state == MessageUnboxedState_ERROR
+	}
+	return false
+}
+
+// IsValidFull returns whether the message is both:
+// 1. Valid
+// 2. Has a non-deleted body with a type matching the header
+//    (TLFNAME is an exception as it has no body)
+func (m MessageUnboxed) IsValidFull() bool {
+	if !m.IsValid() {
+		return false
+	}
+	valid := m.Valid()
+	headerType := valid.ClientHeader.MessageType
+	switch headerType {
+	case MessageType_NONE:
+		return false
+	case MessageType_TLFNAME:
+		// Skip body check
+		return true
+	}
+	bodyType, err := valid.MessageBody.MessageType()
+	if err != nil {
+		return false
+	}
+	return bodyType == headerType
+}
+
+// IsValidDeleted returns whether a message is valid and has been deleted.
+// This statement does not hold: IsValidFull != IsValidDeleted
+func (m MessageUnboxed) IsValidDeleted() bool {
+	if !m.IsValid() {
+		return false
+	}
+	valid := m.Valid()
+	headerType := valid.ClientHeader.MessageType
+	switch headerType {
+	case MessageType_NONE:
+		return false
+	case MessageType_TLFNAME:
+		// Undeletable and may have no body
+		return false
+	}
+	bodyType, err := valid.MessageBody.MessageType()
+	if err != nil {
+		return false
+	}
+	return bodyType == MessageType_NONE
+}
+
+func (m *MessageUnboxed) DebugString() string {
+	if m == nil {
+		return "[nil]"
+	}
+	state, err := m.State()
+	if err != nil {
+		return fmt.Sprintf("[INVALID err:%v]", err)
+	}
+	if state == MessageUnboxedState_ERROR {
+		merr := m.Error()
+		return fmt.Sprintf("[%v %v mt:%v (%v) (%v)]", state, m.GetMessageID(), merr.ErrType, merr.ErrMsg, merr.InternalErrMsg)
+	}
+	switch state {
+	case MessageUnboxedState_VALID:
+		valid := m.Valid()
+		headerType := valid.ClientHeader.MessageType
+		s := fmt.Sprintf("%v %v", state, valid.ServerHeader.MessageID)
+		bodyType, err := valid.MessageBody.MessageType()
+		if err != nil {
+			return fmt.Sprintf("[INVALID-BODY err:%v]", err)
+		}
+		if headerType == bodyType {
+			s = fmt.Sprintf("%v %v", s, headerType)
+		} else {
+			if headerType == MessageType_TLFNAME {
+				s = fmt.Sprintf("%v h:%v (b:%v)", s, headerType, bodyType)
+			} else {
+				s = fmt.Sprintf("%v h:%v != b:%v", s, headerType, bodyType)
+			}
+		}
+		if valid.ServerHeader.SupersededBy != 0 {
+			s = fmt.Sprintf("%v supBy:%v", s, valid.ServerHeader.SupersededBy)
+		}
+		return fmt.Sprintf("[%v]", s)
+	case MessageUnboxedState_OUTBOX:
+		obr := m.Outbox()
+		ostateStr := "CORRUPT"
+		ostate, err := obr.State.State()
+		if err != nil {
+			ostateStr = "CORRUPT"
+		} else {
+			ostateStr = fmt.Sprintf("%v", ostate)
+		}
+		return fmt.Sprintf("[%v obid:%v prev:%v ostate:%v %v]",
+			state, obr.OutboxID, obr.Msg.ClientHeader.OutboxInfo.Prev, ostateStr, obr.Msg.ClientHeader.MessageType)
+	default:
+		return fmt.Sprintf("[state:%v %v]", state, m.GetMessageID())
+	}
+}
+
+func MessageUnboxedDebugStrings(ms []MessageUnboxed) (res []string) {
+	for _, m := range ms {
+		res = append(res, m.DebugString())
+	}
+	return res
+}
+
+func MessageUnboxedDebugList(ms []MessageUnboxed) string {
+	return fmt.Sprintf("{ %v %v }", len(ms), strings.Join(MessageUnboxedDebugStrings(ms), ","))
+}
+
+func MessageUnboxedDebugLines(ms []MessageUnboxed) string {
+	return strings.Join(MessageUnboxedDebugStrings(ms), "\n")
+}
+
+const (
+	VersionErrorMessageBoxed VersionKind = "messageboxed"
+	VersionErrorHeader       VersionKind = "header"
+	VersionErrorBody         VersionKind = "body"
+)
+
+// NOTE: these values correspond to the maximum accepted values in
+// chat/boxer.go. If these values are changed, they must also be accepted
+// there.
+var MaxMessageBoxedVersion MessageBoxedVersion = MessageBoxedVersion_V4
+var MaxHeaderVersion HeaderPlaintextVersion = HeaderPlaintextVersion_V1
+var MaxBodyVersion BodyPlaintextVersion = BodyPlaintextVersion_V1
+
+// ParseableVersion checks if this error has a version that is now able to be
+// understood by our client.
+func (m MessageUnboxedError) ParseableVersion() bool {
+	switch m.ErrType {
+	case MessageUnboxedErrorType_BADVERSION, MessageUnboxedErrorType_BADVERSION_CRITICAL:
+		// only applies to these types
+	default:
+		return false
+	}
+
+	kind := m.VersionKind
+	version := m.VersionNumber
+	// This error was stored from an old client, we have parse out the info we
+	// need from the error message.
+	// TODO remove this check once it has be live for a few cycles.
+	if kind == "" && version == 0 {
+		re := regexp.MustCompile(`.* Chat version error: \[ unhandled: (\w+) version: (\d+) .*\]`)
+		matches := re.FindStringSubmatch(m.ErrMsg)
+		if len(matches) != 3 {
+			return false
+		}
+		kind = VersionKind(matches[1])
+		var err error
+		version, err = strconv.Atoi(matches[2])
+		if err != nil {
+			return false
+		}
+	}
+
+	var maxVersion int
+	switch kind {
+	case VersionErrorMessageBoxed:
+		maxVersion = int(MaxMessageBoxedVersion)
+	case VersionErrorHeader:
+		maxVersion = int(MaxHeaderVersion)
+	case VersionErrorBody:
+		maxVersion = int(MaxBodyVersion)
+	default:
+		return false
+	}
+	return maxVersion >= version
+}
+
 func (m MessageUnboxedValid) AsDeleteHistory() (res MessageDeleteHistory, err error) {
 	if m.ClientHeader.MessageType != MessageType_DELETEHISTORY {
 		return res, fmt.Errorf("message is %v not %v", m.ClientHeader.MessageType, MessageType_DELETEHISTORY)
@@ -232,6 +457,108 @@ func (m MessageUnboxedValid) AsDeleteHistory() (res MessageDeleteHistory, err er
 		return res, fmt.Errorf("message has wrong body type: %v", btyp)
 	}
 	return m.MessageBody.Deletehistory(), nil
+}
+
+func (m *MsgEphemeralMetadata) String() string {
+	if m == nil {
+		return "<nil>"
+	}
+	var explodedBy string
+	if m.ExplodedBy == nil {
+		explodedBy = "<nil>"
+	} else {
+		explodedBy = *m.ExplodedBy
+	}
+	return fmt.Sprintf("{ Lifetime: %v, Generation: %v, ExplodedBy: %v }", time.Second*time.Duration(m.Lifetime), m.Generation, explodedBy)
+}
+
+func (m MessagePlaintext) IsEphemeral() bool {
+	return m.EphemeralMetadata() != nil
+}
+
+func (m MessagePlaintext) EphemeralMetadata() *MsgEphemeralMetadata {
+	return m.ClientHeader.EphemeralMetadata
+}
+
+func (o *MsgEphemeralMetadata) Eq(r *MsgEphemeralMetadata) bool {
+	if o != nil && r != nil {
+		return *o == *r
+	}
+	return (o == nil) && (r == nil)
+}
+
+func (m MessageUnboxedValid) HasPairwiseMacs() bool {
+	return m.ClientHeader.HasPairwiseMacs
+}
+
+func (m MessageUnboxedValid) IsEphemeral() bool {
+	return m.EphemeralMetadata() != nil
+}
+
+func (m MessageUnboxedValid) EphemeralMetadata() *MsgEphemeralMetadata {
+	return m.ClientHeader.EphemeralMetadata
+}
+
+func (m MessageUnboxedValid) ExplodedBy() *string {
+	if !m.IsEphemeral() {
+		return nil
+	}
+	return m.EphemeralMetadata().ExplodedBy
+}
+
+func Etime(lifetime gregor1.DurationSec, ctime, rtime, now gregor1.Time) gregor1.Time {
+	originalLifetime := time.Second * time.Duration(lifetime)
+	elapsedLifetime := now.Time().Sub(ctime.Time())
+	remainingLifetime := originalLifetime - elapsedLifetime
+	// If the server's view doesn't make sense, just use the signed lifetime
+	// from the message.
+	if remainingLifetime > originalLifetime {
+		remainingLifetime = originalLifetime
+	}
+	etime := rtime.Time().Add(remainingLifetime)
+	return gregor1.ToTime(etime)
+}
+
+func (m MessageUnboxedValid) Etime() gregor1.Time {
+	// The server sends us (untrusted) ctime of the message and server's view
+	// of now. We use these to calculate the remaining lifetime on an ephemeral
+	// message, returning an etime based on our received time.
+	metadata := m.EphemeralMetadata()
+	if metadata == nil {
+		return 0
+	}
+	header := m.ServerHeader
+	return Etime(metadata.Lifetime, header.Ctime, m.ClientHeader.Rtime, header.Now)
+}
+
+func (m MessageUnboxedValid) RemainingEphemeralLifetime(now time.Time) time.Duration {
+	remainingLifetime := m.Etime().Time().Sub(now).Round(time.Second)
+	return remainingLifetime
+}
+
+func (m MessageUnboxedValid) IsEphemeralExpired(now time.Time) bool {
+	if !m.IsEphemeral() {
+		return false
+	}
+	etime := m.Etime().Time()
+	// There are a few ways a message could be considered expired
+	// 1. Our body is already nil (deleted from DELETEHISTORY or a server purge)
+	// 2. We were "exploded now"
+	// 3. Our lifetime is up
+	return m.MessageBody.IsNil() || m.EphemeralMetadata().ExplodedBy != nil || etime.Before(now) || etime.Equal(now)
+}
+
+func (m MessageUnboxedValid) HideExplosion(expunge *Expunge, now time.Time) bool {
+	if !m.IsEphemeral() {
+		return false
+	}
+	var upTo MessageID
+	if expunge != nil {
+		upTo = expunge.Upto
+	}
+	etime := m.Etime()
+	// Don't show ash lines for messages that have been expunged.
+	return etime.Time().Add(ShowExplosionLifetime).Before(now) || m.ServerHeader.MessageID < upTo
 }
 
 func (b MessageBody) IsNil() bool {
@@ -306,6 +633,45 @@ func (m MessageBoxed) Summary() MessageSummary {
 	return s
 }
 
+func (m MessageBoxed) OutboxInfo() *OutboxInfo {
+	return m.ClientHeader.OutboxInfo
+}
+
+func (m MessageBoxed) KBFSEncrypted() bool {
+	return m.ClientHeader.KbfsCryptKeysUsed == nil || *m.ClientHeader.KbfsCryptKeysUsed
+}
+
+func (m MessageBoxed) EphemeralMetadata() *MsgEphemeralMetadata {
+	return m.ClientHeader.EphemeralMetadata
+}
+
+func (m MessageBoxed) IsEphemeral() bool {
+	return m.EphemeralMetadata() != nil
+}
+
+func (m MessageBoxed) Etime() gregor1.Time {
+	// The server sends us (untrusted) ctime of the message and server's view
+	// of now. We use these to calculate the remaining lifetime on an ephemeral
+	// message, returning an etime based on the current time.
+	metadata := m.EphemeralMetadata()
+	if metadata == nil {
+		return 0
+	}
+	rtime := gregor1.ToTime(time.Now())
+	if m.ServerHeader.Rtime != nil {
+		rtime = *m.ServerHeader.Rtime
+	}
+	return Etime(metadata.Lifetime, m.ServerHeader.Ctime, rtime, m.ServerHeader.Now)
+}
+
+func (m MessageBoxed) IsEphemeralExpired(now time.Time) bool {
+	if !m.IsEphemeral() {
+		return false
+	}
+	etime := m.Etime().Time()
+	return m.EphemeralMetadata().ExplodedBy != nil || etime.Before(now) || etime.Equal(now)
+}
+
 var ConversationStatusGregorMap = map[ConversationStatus]string{
 	ConversationStatus_UNFILED:  "unfiled",
 	ConversationStatus_FAVORITE: "favorite",
@@ -348,6 +714,11 @@ func (t ConversationIDTriple) Derivable(cid ConversationID) bool {
 	return bytes.Equal(h[2:], []byte(cid[2:]))
 }
 
+func MakeOutboxID(s string) (OutboxID, error) {
+	b, err := hex.DecodeString(s)
+	return OutboxID(b), err
+}
+
 func (o *OutboxID) Eq(r *OutboxID) bool {
 	if o != nil && r != nil {
 		return bytes.Equal(*o, *r)
@@ -368,6 +739,10 @@ func (o *OutboxInfo) Eq(r *OutboxInfo) bool {
 		return *o == *r
 	}
 	return (o == nil) && (r == nil)
+}
+
+func (o OutboxRecord) IsAttachment() bool {
+	return o.Msg.ClientHeader.MessageType == MessageType_ATTACHMENT
 }
 
 func (p MessagePreviousPointer) Eq(other MessagePreviousPointer) bool {
@@ -406,7 +781,7 @@ func (c ConversationInfoLocal) TLFNameExpanded() string {
 
 // TLFNameExpandedSummary returns a TLF name with a summary of the
 // account reset if there was one.
-// This version is for display purposes only and connot be used to lookup the TLF.
+// This version is for display purposes only and cannot be used to lookup the TLF.
 func (c ConversationInfoLocal) TLFNameExpandedSummary() string {
 	if c.FinalizeInfo == nil {
 		return c.TlfName
@@ -469,9 +844,28 @@ func (f *ConversationFinalizeInfo) BeforeSummary() string {
 	return fmt.Sprintf("(before %s account reset %s)", f.ResetUser, f.ResetDate)
 }
 
-func (p Pagination) Eq(other Pagination) bool {
-	return p.Last == other.Last && bytes.Equal(p.Next, other.Next) &&
-		bytes.Equal(p.Previous, other.Previous) && p.Num == other.Num
+func (p *Pagination) Eq(other *Pagination) bool {
+	if p == nil && other == nil {
+		return true
+	}
+	if p != nil && other != nil {
+		return p.Last == other.Last && bytes.Equal(p.Next, other.Next) &&
+			bytes.Equal(p.Previous, other.Previous) && p.Num == other.Num
+	}
+	return false
+}
+
+func (p *Pagination) String() string {
+	if p == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("[Num: %d n: %s p: %s last: %v]", p.Num, hex.EncodeToString(p.Next),
+		hex.EncodeToString(p.Previous), p.Last)
+}
+
+// FirstPage returns true if the pagination object is not pointing in any direction
+func (p *Pagination) FirstPage() bool {
+	return p == nil || (len(p.Next) == 0 && len(p.Previous) == 0)
 }
 
 func (c ConversationLocal) GetMtime() gregor1.Time {
@@ -492,6 +886,14 @@ func (c ConversationLocal) GetMembersType() ConversationMembersType {
 
 func (c ConversationLocal) GetFinalizeInfo() *ConversationFinalizeInfo {
 	return c.Info.FinalizeInfo
+}
+
+func (c ConversationLocal) GetExpunge() *Expunge {
+	return &c.Expunge
+}
+
+func (c ConversationLocal) IsPublic() bool {
+	return c.Info.Visibility == keybase1.TLFVisibility_PUBLIC
 }
 
 func (c ConversationLocal) GetMaxMessage(typ MessageType) (MessageUnboxed, error) {
@@ -528,6 +930,14 @@ func (c Conversation) GetMembersType() ConversationMembersType {
 
 func (c Conversation) GetFinalizeInfo() *ConversationFinalizeInfo {
 	return c.Metadata.FinalizeInfo
+}
+
+func (c Conversation) GetExpunge() *Expunge {
+	return &c.Expunge
+}
+
+func (c Conversation) IsPublic() bool {
+	return c.Metadata.Visibility == keybase1.TLFVisibility_PUBLIC
 }
 
 func (c Conversation) GetMaxMessage(typ MessageType) (MessageSummary, error) {
@@ -663,6 +1073,10 @@ func (r *GetInboxAndUnboxLocalRes) SetOffline() {
 	r.Offline = true
 }
 
+func (r *GetInboxAndUnboxUILocalRes) SetOffline() {
+	r.Offline = true
+}
+
 func (r *GetThreadLocalRes) SetOffline() {
 	r.Offline = true
 }
@@ -724,6 +1138,12 @@ func MakeEmptyUnreadUpdate(convID ConversationID) UnreadUpdate {
 		UnreadMessages:          0,
 		UnreadNotifyingMessages: counts,
 	}
+}
+
+func (u UnreadUpdate) String() string {
+	return fmt.Sprintf("[d:%v c:%s u:%d nd:%d nm:%d]", u.Diff, u.ConvID, u.UnreadMessages,
+		u.UnreadNotifyingMessages[keybase1.DeviceType_DESKTOP],
+		u.UnreadNotifyingMessages[keybase1.DeviceType_MOBILE])
 }
 
 func (s TopicNameState) Bytes() []byte {
@@ -797,4 +1217,361 @@ func (p RetentionPolicy) Summary() string {
 
 func TeamIDToTLFID(teamID keybase1.TeamID) (TLFID, error) {
 	return MakeTLFID(teamID.String())
+}
+
+func (r *NonblockFetchRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *NonblockFetchRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *MarkAsReadLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *MarkAsReadLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *GetInboxAndUnboxLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *GetInboxAndUnboxLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *GetInboxAndUnboxUILocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *GetInboxAndUnboxUILocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *GetThreadLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *GetThreadLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *NewConversationLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *NewConversationLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *GetInboxSummaryForCLILocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *GetInboxSummaryForCLILocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *GetMessagesLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *GetMessagesLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *SetConversationStatusLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *SetConversationStatusLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *PostLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *PostLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *GetConversationForCLILocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *GetConversationForCLILocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *PostLocalNonblockRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *PostLocalNonblockRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *DownloadAttachmentLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *DownloadAttachmentLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *FindConversationsLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *FindConversationsLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *JoinLeaveConversationLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *JoinLeaveConversationLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *DeleteConversationLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *DeleteConversationLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *GetTLFConversationsLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *GetTLFConversationsLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *SetAppNotificationSettingsLocalRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *SetAppNotificationSettingsLocalRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *GetSearchRegexpRes) GetRateLimit() []RateLimit {
+	return r.RateLimits
+}
+
+func (r *GetSearchRegexpRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimits = rl
+}
+
+func (r *GetInboxRemoteRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *GetInboxRemoteRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *GetInboxByTLFIDRemoteRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *GetInboxByTLFIDRemoteRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *GetThreadRemoteRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *GetThreadRemoteRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *GetConversationMetadataRemoteRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *GetConversationMetadataRemoteRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *PostRemoteRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *PostRemoteRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *NewConversationRemoteRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *NewConversationRemoteRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *GetMessagesRemoteRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *GetMessagesRemoteRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *MarkAsReadRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *MarkAsReadRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *SetConversationStatusRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *SetConversationStatusRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *GetPublicConversationsRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *GetPublicConversationsRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *JoinLeaveConversationRemoteRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *JoinLeaveConversationRemoteRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *DeleteConversationRemoteRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *DeleteConversationRemoteRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *GetMessageBeforeRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *GetMessageBeforeRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *GetTLFConversationsRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *GetTLFConversationsRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *SetAppNotificationSettingsRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *SetAppNotificationSettingsRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (r *SetRetentionRes) GetRateLimit() (res []RateLimit) {
+	if r.RateLimit != nil {
+		res = []RateLimit{*r.RateLimit}
+	}
+	return res
+}
+
+func (r *SetRetentionRes) SetRateLimits(rl []RateLimit) {
+	r.RateLimit = &rl[0]
+}
+
+func (i EphemeralPurgeInfo) String() string {
+	return fmt.Sprintf("EphemeralPurgeInfo{ ConvID: %v, IsActive: %v, NextPurgeTime: %v, MinUnexplodedID: %v }",
+		i.ConvID, i.IsActive, i.NextPurgeTime.Time(), i.MinUnexplodedID)
+}
+
+func (r ReactionMap) HasReactionFromUser(reactionText, username string) (found bool, reactionMsgID MessageID) {
+	reactions, ok := r.Reactions[reactionText]
+	if !ok {
+		return false, 0
+	}
+	reactionMessageID, ok := reactions[username]
+	return ok, reactionMessageID
+}
+
+func (i *ConversationMinWriterRoleInfoLocal) String() string {
+	if i == nil {
+		return "Minimum writer role for this conversation is not set."
+	}
+	usernameSuffix := "."
+	if i.Username != "" {
+		usernameSuffix = fmt.Sprintf(", last set by %v.", i.Username)
+	}
+	return fmt.Sprintf("Minimum writer role for this conversation is %v%v", i.Role, usernameSuffix)
+}
+
+func (s *ConversationSettings) IsNil() bool {
+	return s == nil || s.MinWriterRoleInfo == nil
 }

@@ -6,6 +6,7 @@ package libkbfs
 
 import (
 	"errors"
+	"time"
 
 	"github.com/keybase/client/go/logger"
 	"github.com/keybase/kbfs/tlf"
@@ -47,7 +48,9 @@ func WaitForTLFJournal(ctx context.Context, config Config, tlfID tlf.ID,
 	return nil
 }
 
-func fillInJournalStatusUnflushedPaths(ctx context.Context, config Config,
+// FillInJournalStatusUnflushedPaths adds the unflushed paths to the
+// given journal status.
+func FillInJournalStatusUnflushedPaths(ctx context.Context, config Config,
 	jStatus *JournalServerStatus, tlfIDs []tlf.ID) error {
 	if len(tlfIDs) == 0 {
 		// Nothing to do.
@@ -60,6 +63,7 @@ func fillInJournalStatusUnflushedPaths(ctx context.Context, config Config,
 	unflushedPaths := make(chan []string, len(tlfIDs))
 	storedBytes := make(chan int64, len(tlfIDs))
 	unflushedBytes := make(chan int64, len(tlfIDs))
+	endEstimates := make(chan *time.Time, len(tlfIDs))
 	errIncomplete := errors.New("Incomplete status")
 	statusFn := func() error {
 		for tlfID := range statusesToFetch {
@@ -87,6 +91,7 @@ func fillInJournalStatusUnflushedPaths(ctx context.Context, config Config,
 			}
 			storedBytes <- status.Journal.StoredBytes
 			unflushedBytes <- status.Journal.UnflushedBytes
+			endEstimates <- status.Journal.EndEstimate
 		}
 		return nil
 	}
@@ -109,6 +114,7 @@ func fillInJournalStatusUnflushedPaths(ctx context.Context, config Config,
 	close(unflushedPaths)
 	close(storedBytes)
 	close(unflushedBytes)
+	close(endEstimates)
 
 	// Aggregate all the paths together, but only allow one incomplete
 	// marker, at the very end.
@@ -138,6 +144,13 @@ func fillInJournalStatusUnflushedPaths(ctx context.Context, config Config,
 		jStatus.UnflushedBytes = 0
 		for ub := range unflushedBytes {
 			jStatus.UnflushedBytes += ub
+		}
+		// Pick the latest end estimate.
+		for e := range endEstimates {
+			if e != nil &&
+				(jStatus.EndEstimate == nil || jStatus.EndEstimate.Before(*e)) {
+				jStatus.EndEstimate = e
+			}
 		}
 	}
 	return nil

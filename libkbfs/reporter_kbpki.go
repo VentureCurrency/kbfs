@@ -80,8 +80,11 @@ type ReporterKBPKI struct {
 	config           Config
 	log              logger.Logger
 	notifyBuffer     chan *keybase1.FSNotification
+	notifyPathBuffer chan string
 	notifySyncBuffer chan *keybase1.FSPathSyncStatus
+	suppressCh       chan time.Duration
 	canceler         func()
+	done             <-chan struct{}
 }
 
 // NewReporterKBPKI creates a new ReporterKBPKI.
@@ -91,10 +94,13 @@ func NewReporterKBPKI(config Config, maxErrors, bufSize int) *ReporterKBPKI {
 		config:           config,
 		log:              config.MakeLogger(""),
 		notifyBuffer:     make(chan *keybase1.FSNotification, bufSize),
+		notifyPathBuffer: make(chan string, bufSize),
 		notifySyncBuffer: make(chan *keybase1.FSPathSyncStatus, bufSize),
+		suppressCh:       make(chan time.Duration, 1),
 	}
 	var ctx context.Context
 	ctx, r.canceler = context.WithCancel(context.Background())
+	r.done = ctx.Done()
 	go r.send(ctx)
 	return r
 }
@@ -152,6 +158,9 @@ func (r *ReporterKBPKI) ReportErr(ctx context.Context,
 		code = keybase1.FSErrorType_NOT_IMPLEMENTED
 		params[errorParamFeature] = errorFeatureDirLimit
 	case kbfsmd.NewMetadataVersionError:
+		code = keybase1.FSErrorType_OLD_VERSION
+		err = OutdatedVersionError{}
+	case kbfsmd.NewMerkleVersionError:
 		code = keybase1.FSErrorType_OLD_VERSION
 		err = OutdatedVersionError{}
 	case NewDataVersionError:
@@ -212,6 +221,20 @@ func (r *ReporterKBPKI) Notify(ctx context.Context, notification *keybase1.FSNot
 	}
 }
 
+// NotifyPathUpdated implements the Reporter interface for ReporterKBPKI.
+//
+// TODO: might be useful to get the debug tags out of ctx and store
+//       them in the notifyPathBuffer as well so that send() can put
+//       them back in its context.
+func (r *ReporterKBPKI) NotifyPathUpdated(ctx context.Context, path string) {
+	select {
+	case r.notifyPathBuffer <- path:
+	default:
+		r.log.CDebugf(ctx,
+			"ReporterKBPKI: notify path buffer full, dropping %s", path)
+	}
+}
+
 // NotifySyncStatus implements the Reporter interface for ReporterKBPKI.
 //
 // TODO: might be useful to get the debug tags out of ctx and store
@@ -227,6 +250,16 @@ func (r *ReporterKBPKI) NotifySyncStatus(ctx context.Context,
 	}
 }
 
+// SuppressNotifications implements the Reporter interface for ReporterKBPKI.
+func (r *ReporterKBPKI) SuppressNotifications(
+	ctx context.Context, suppressDuration time.Duration) {
+	select {
+	case r.suppressCh <- suppressDuration:
+	case <-ctx.Done():
+	case <-r.done:
+	}
+}
+
 // Shutdown implements the Reporter interface for ReporterKBPKI.
 func (r *ReporterKBPKI) Shutdown() {
 	r.canceler()
@@ -237,26 +270,79 @@ func (r *ReporterKBPKI) Shutdown() {
 // send takes notifications out of notifyBuffer and notifySyncBuffer
 // and sends them to the keybase daemon.
 func (r *ReporterKBPKI) send(ctx context.Context) {
+	suppressTimer := time.NewTimer(0)
+	suppressed := false
+	var stagedNotification *keybase1.FSNotification
+	var stagedPath string
+	var stagedStatus *keybase1.FSPathSyncStatus
+
 	for {
 		select {
 		case notification, ok := <-r.notifyBuffer:
 			if !ok {
 				return
 			}
-			if err := r.config.KeybaseService().Notify(ctx,
+			if suppressed {
+				stagedNotification = notification
+			} else if err := r.config.KeybaseService().Notify(ctx,
 				notification); err != nil {
 				r.log.CDebugf(ctx, "ReporterDaemon: error sending "+
 					"notification: %s", err)
+			}
+		case path, ok := <-r.notifyPathBuffer:
+			if !ok {
+				return
+			}
+			if suppressed {
+				stagedPath = path
+			} else if err := r.config.KeybaseService().NotifyPathUpdated(
+				ctx, path); err != nil {
+				r.log.CDebugf(ctx, "ReporterDaemon: error sending "+
+					"notification for path: %s", err)
 			}
 		case status, ok := <-r.notifySyncBuffer:
 			if !ok {
 				return
 			}
-			if err := r.config.KeybaseService().NotifySyncStatus(ctx,
+			if suppressed {
+				stagedStatus = status
+			} else if err := r.config.KeybaseService().NotifySyncStatus(ctx,
 				status); err != nil {
 				r.log.CDebugf(ctx, "ReporterDaemon: error sending "+
 					"sync status: %s", err)
 			}
+		case suppressFor, ok := <-r.suppressCh:
+			if !ok {
+				return
+			}
+			suppressTimer.Reset(suppressFor)
+			suppressed = true
+		case <-suppressTimer.C:
+			if stagedNotification != nil {
+				if err := r.config.KeybaseService().Notify(ctx,
+					stagedNotification); err != nil {
+					r.log.CDebugf(ctx, "ReporterDaemon: error sending "+
+						"notification: %s", err)
+				}
+				stagedNotification = nil
+			}
+			if stagedPath != "" {
+				if err := r.config.KeybaseService().NotifyPathUpdated(
+					ctx, stagedPath); err != nil {
+					r.log.CDebugf(ctx, "ReporterDaemon: error sending "+
+						"notification for path: %s", err)
+				}
+				stagedPath = ""
+			}
+			if stagedStatus != nil {
+				if err := r.config.KeybaseService().NotifySyncStatus(ctx,
+					stagedStatus); err != nil {
+					r.log.CDebugf(ctx, "ReporterDaemon: error sending "+
+						"sync status: %s", err)
+				}
+				stagedStatus = nil
+			}
+			suppressed = false
 		}
 	}
 }

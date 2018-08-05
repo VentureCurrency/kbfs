@@ -78,9 +78,9 @@ func (d Delegator) IsEldest() bool { return d.DelegationType == DelegationTypeEl
 // of performing the key delegation.
 func (d Delegator) GetMerkleTriple() MerkleTriple { return d.merkleTriple }
 
-func (d *Delegator) CheckArgs() (err error) {
+func (d *Delegator) CheckArgs(m MetaContext) (err error) {
 
-	d.G().Log.Debug("+ Delegator::checkArgs()")
+	defer m.CTrace("Delegator#CheckArgs", func() error { return err })()
 
 	if d.DelegationType == "" {
 		err = MissingDelegationTypeError{}
@@ -92,9 +92,9 @@ func (d *Delegator) CheckArgs() (err error) {
 	}
 
 	if d.ExistingKey != nil {
-		d.G().Log.Debug("| Picked passed-in signing key")
+		m.CDebugf("| Picked passed-in signing key")
 	} else {
-		d.G().Log.Debug("| Picking new key for an eldest self-sig")
+		m.CDebugf("| Picking new key for an eldest self-sig")
 		d.DelegationType = DelegationTypeEldest
 	}
 
@@ -106,8 +106,7 @@ func (d *Delegator) CheckArgs() (err error) {
 		d.EldestKID = kid
 	}
 
-	d.G().Log.Debug("| Picked key %s for signing", d.getSigningKID())
-	d.G().Log.Debug("- Delegator::checkArgs()")
+	m.CDebugf("| Picked key %s for signing", d.getSigningKID())
 
 	return nil
 }
@@ -116,36 +115,32 @@ func (d *Delegator) CheckArgs() (err error) {
 // the delegator. This will check the given key first, then a device Key if we have one,
 // and otherwise will leave the signing key unset so that we will set it
 // as the eldest key on upload.
-// lctx can be nil.
-func (d *Delegator) LoadSigningKey(lctx LoginContext, ui SecretUI) (err error) {
-
-	d.G().Log.Debug("+ Delegator::LoadSigningKey")
-	defer func() {
-		d.G().Log.Debug("+ Delegator::LoadSigningKey -> %s, (found=%v)", ErrToOk(err), (d.GetSigningKey() != nil))
-	}()
+// m.LoginContext can be nil.
+func (d *Delegator) LoadSigningKey(m MetaContext, ui SecretUI) (err error) {
+	defer m.CTrace("Delegator#LoadSigningKey", func() error { return err })()
 
 	if d.ExistingKey != nil {
-		d.G().Log.Debug("| Was set ahead of time")
-		return
+		m.CDebugf("| Was set ahead of time")
+		return nil
 	}
 
 	if d.Me == nil {
 		d.Me, err = LoadMe(NewLoadUserPubOptionalArg(d.G()))
 		if err != nil {
-			return
-		} else if d.Me == nil {
-			d.G().Log.Debug("| Me didn't load")
-			return
+			return err
+		}
+		if d.Me == nil {
+			m.CDebugf("| Me didn't load")
+			return nil
 		}
 	}
 
 	if !d.Me.HasActiveKey() {
-		d.G().Log.Debug("| PGPKeyImportEngine: no active key found, so assuming set of eldest key")
-		return
+		m.CDebugf("| PGPKeyImportEngine: no active key found, so assuming set of eldest key")
+		return nil
 	}
 
 	arg := SecretKeyPromptArg{
-		LoginContext: lctx,
 		Ska: SecretKeyArg{
 			Me:      d.Me,
 			KeyType: DeviceSigningKeyType,
@@ -153,72 +148,64 @@ func (d *Delegator) LoadSigningKey(lctx LoginContext, ui SecretUI) (err error) {
 		SecretUI: ui,
 		Reason:   "sign new key",
 	}
-	d.ExistingKey, err = d.G().Keyrings.GetSecretKeyWithPrompt(arg)
+	d.ExistingKey, err = m.G().Keyrings.GetSecretKeyWithPrompt(m, arg)
 
 	return err
 }
 
 // Run the Delegator, performing all necessary internal operations.  Return err
 // on failure and nil on success.
-func (d *Delegator) Run(lctx LoginContext) (err error) {
+func (d *Delegator) Run(m MetaContext) (err error) {
 	var jw *jsonw.Wrapper
+	defer m.CTrace("Delegator#Run", func() error { return err })()
 
-	d.G().Log.Debug("+ Delegator.Run()")
-	defer func() {
-		d.G().Log.Debug("- Delegator.Run() -> %s", ErrToOk(err))
-	}()
-
-	if err = d.CheckArgs(); err != nil {
+	if err = d.CheckArgs(m); err != nil {
 		return
 	}
 
-	d.MerkleRoot = d.G().MerkleClient.LastRoot()
+	d.MerkleRoot = m.G().MerkleClient.LastRoot()
 
 	// We'll need to generate two proofs, so set the Ctime
 	// so that we get the same time both times
-	d.Ctime = d.G().Clock().Now().Unix()
+	d.Ctime = m.G().Clock().Now().Unix()
 
 	// For a sibkey signature, we first sign the blob with the
 	// sibkey, and then embed that signature for the delegating key
 	if d.DelegationType == DelegationTypeSibkey {
-		if jw, err = KeyProof(*d); err != nil {
-			d.G().Log.Debug("| Failure in intermediate KeyProof()")
+		if jw, err = KeyProof(m, *d); err != nil {
+			m.CDebugf("| Failure in intermediate KeyProof()")
 			return err
 		}
 
 		if d.RevSig, _, _, err = SignJSON(jw, d.NewKey); err != nil {
-			d.G().Log.Debug("| Failure in intermediate SignJson()")
+			m.CDebugf("| Failure in intermediate SignJson()")
 			return err
 		}
 	}
 
-	if d.GStrict() == nil {
-		panic("null g strict")
-	}
-
-	if d.GStrict().LocalDb == nil {
+	if m.G().LocalDb == nil {
 		panic("should have a local DB")
 	}
 
-	if jw, err = KeyProof(*d); err != nil {
-		d.G().Log.Debug("| Failure in KeyProof()")
+	if jw, err = KeyProof(m, *d); err != nil {
+		m.CDebugf("| Failure in KeyProof()")
 		return
 	}
 
-	return d.SignAndPost(lctx, jw)
+	return d.SignAndPost(m, jw)
 }
 
-func (d *Delegator) SignAndPost(lctx LoginContext, jw *jsonw.Wrapper) (err error) {
+func (d *Delegator) SignAndPost(m MetaContext, jw *jsonw.Wrapper) (err error) {
 
 	var linkid LinkID
 
 	if d.sig, d.sigID, linkid, err = SignJSON(jw, d.GetSigningKey()); err != nil {
-		d.G().Log.Debug("| Failure in SignJson()")
+		m.CDebugf("| Failure in SignJson()")
 		return err
 	}
 
-	if err = d.post(lctx); err != nil {
-		d.G().Log.Debug("| Failure in post()")
+	if err = d.post(m); err != nil {
+		m.CDebugf("| Failure in post()")
 		return
 	}
 
@@ -235,7 +222,7 @@ func (d *Delegator) updateLocalState(linkid LinkID) (err error) {
 	return d.Me.localDelegateKey(d.NewKey, d.sigID, d.getExistingKID(), d.IsSibkeyOrEldest(), d.IsEldest(), d.getMerkleHashMeta(), keybase1.Seqno(0))
 }
 
-func (d *Delegator) post(lctx LoginContext) (err error) {
+func (d *Delegator) post(m MetaContext) (err error) {
 	var pub string
 	if pub, err = d.NewKey.Encode(); err != nil {
 		return
@@ -274,16 +261,13 @@ func (d *Delegator) post(lctx LoginContext) (err error) {
 		Endpoint:    "key/add",
 		SessionType: APISessionTypeREQUIRED,
 		Args:        hargs,
+		MetaContext: m,
 	}
-	if lctx != nil {
-		arg.SessionR = lctx.LocalSession()
-	}
-
 	if d.Aggregated {
 		d.postArg = arg
 		return nil
 	}
-	_, err = d.G().API.Post(arg)
+	_, err = m.G().API.Post(arg)
 
 	return err
 }

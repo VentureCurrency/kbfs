@@ -8,6 +8,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -127,6 +128,25 @@ func HashMetaFromString(s string) (ret HashMeta, err error) {
 	return HashMeta(b), nil
 }
 
+func KBFSRootHashFromString(s string) (ret KBFSRootHash, err error) {
+	if s == "null" {
+		return nil, nil
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return ret, err
+	}
+	return KBFSRootHash(b), nil
+}
+
+func (h KBFSRootHash) String() string {
+	return hex.EncodeToString(h)
+}
+
+func (h KBFSRootHash) Eq(h2 KBFSRootHash) bool {
+	return hmac.Equal(h[:], h2[:])
+}
+
 func (h HashMeta) String() string {
 	return hex.EncodeToString(h)
 }
@@ -142,6 +162,62 @@ func (h *HashMeta) UnmarshalJSON(b []byte) error {
 	}
 	*h = hm
 	return nil
+}
+
+func (h *KBFSRootHash) UnmarshalJSON(b []byte) error {
+	rh, err := KBFSRootHashFromString(Unquote(b))
+	if err != nil {
+		return err
+	}
+	*h = rh
+	return nil
+}
+
+func SHA512FromString(s string) (ret SHA512, err error) {
+	if s == "null" {
+		return nil, nil
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return ret, err
+	}
+	if len(b) != 64 {
+		return nil, fmt.Errorf("Wanted a 64-byte SHA512, but got %d bytes", len(b))
+	}
+	return SHA512(b), nil
+}
+
+func (s SHA512) String() string {
+	return hex.EncodeToString(s)
+}
+
+func (s SHA512) Eq(s2 SHA512) bool {
+	return hmac.Equal(s[:], s2[:])
+}
+
+func (s *SHA512) UnmarshalJSON(b []byte) error {
+	tmp, err := SHA512FromString(Unquote(b))
+	if err != nil {
+		return err
+	}
+	*s = tmp
+	return nil
+}
+
+func (t *ResetType) UnmarshalJSON(b []byte) error {
+	var err error
+	s := strings.TrimSpace(string(b))
+	var ret ResetType
+	switch s {
+	case "\"reset\"", "1":
+		ret = ResetType_RESET
+	case "\"delete\"", "2":
+		ret = ResetType_DELETE
+	default:
+		err = fmt.Errorf("Bad reset type: %s", s)
+	}
+	*t = ret
+	return err
 }
 
 func (l *LeaseID) UnmarshalJSON(b []byte) error {
@@ -352,6 +428,10 @@ func UIDFromString(s string) (UID, error) {
 	return UID(s), nil
 }
 
+func UIDFromSlice(b []byte) (UID, error) {
+	return UIDFromString(hex.EncodeToString(b))
+}
+
 // Used by unit tests.
 func MakeTestUID(n uint32) UID {
 	b := make([]byte, 8)
@@ -414,6 +494,18 @@ func TeamIDFromString(s string) (TeamID, error) {
 	}
 	return "", fmt.Errorf("Bad TeamID '%s': must end in one of [0x%x, 0x%x, 0x%x, 0x%x]",
 		s, TEAMID_PRIVATE_SUFFIX_HEX, TEAMID_PUBLIC_SUFFIX_HEX, SUB_TEAMID_PRIVATE_SUFFIX, SUB_TEAMID_PUBLIC_SUFFIX)
+}
+
+func UserOrTeamIDFromString(s string) (UserOrTeamID, error) {
+	UID, errUser := UIDFromString(s)
+	if errUser == nil {
+		return UID.AsUserOrTeam(), nil
+	}
+	teamID, errTeam := TeamIDFromString(s)
+	if errTeam == nil {
+		return teamID.AsUserOrTeam(), nil
+	}
+	return "", fmt.Errorf("Bad UserOrTeamID: could not parse %s as a UID (err = %v) or team id (err = %v)", s, errUser, errTeam)
 }
 
 // Used by unit tests.
@@ -525,6 +617,8 @@ func (s SigID) IsNil() bool {
 func (s SigID) Exists() bool {
 	return !s.IsNil()
 }
+
+func (s SigID) String() string { return string(s) }
 
 func (s SigID) Equal(t SigID) bool {
 	return s == t
@@ -647,6 +741,14 @@ func ToTime(t time.Time) Time {
 	return Time(t.UnixNano() / 1000000)
 }
 
+func ToTimePtr(t *time.Time) *Time {
+	if t == nil {
+		return nil
+	}
+	ret := ToTime(*t)
+	return &ret
+}
+
 func TimeFromSeconds(seconds int64) Time {
 	return Time(seconds * 1000)
 }
@@ -658,6 +760,45 @@ func (t Time) Before(t2 Time) bool { return t < t2 }
 func FormatTime(t Time) string {
 	layout := "2006-01-02 15:04:05 MST"
 	return FromTime(t).Format(layout)
+}
+
+func FromUnixTime(u UnixTime) time.Time {
+	return FromTime(Time(u * 1000))
+}
+
+func (u UnixTime) Time() time.Time {
+	return FromUnixTime(u)
+}
+
+func (u UnixTime) UnixSeconds() int64 {
+	return int64(u)
+}
+
+func (u UnixTime) UnixMilliseconds() int64 {
+	return int64(u) * 1000
+}
+
+func (u UnixTime) UnixMicroseconds() int64 {
+	return int64(u) * 1000000
+}
+
+func ToUnixTime(t time.Time) UnixTime {
+	if t.IsZero() {
+		return 0
+	}
+	return UnixTime(t.Unix())
+}
+
+func UnixTimeFromSeconds(seconds int64) UnixTime {
+	return UnixTime(seconds)
+}
+
+func (u UnixTime) IsZero() bool            { return u == UnixTime(0) }
+func (u UnixTime) After(u2 UnixTime) bool  { return u > u2 }
+func (u UnixTime) Before(u2 UnixTime) bool { return u < u2 }
+func FormatUnixTime(u UnixTime) string {
+	layout := "2006-01-02 15:04:05 MST"
+	return FromUnixTime(u).Format(layout)
 }
 
 func (s Status) Error() string {
@@ -728,6 +869,15 @@ func (u *UID) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+func (u *UserOrTeamID) UnmarshalJSON(b []byte) error {
+	utid, err := UserOrTeamIDFromString(Unquote(b))
+	if err != nil {
+		return err
+	}
+	*u = utid
+	return nil
+}
+
 // Size implements the cache.Measurable interface.
 func (u UID) Size() int {
 	return len(u) + ptrSize
@@ -735,6 +885,14 @@ func (u UID) Size() int {
 
 func (k *KID) MarshalJSON() ([]byte, error) {
 	return Quote(k.String()), nil
+}
+
+func (u *UID) MarshalJSON() ([]byte, error) {
+	return Quote(u.String()), nil
+}
+
+func (u *UserOrTeamID) MarshalJSON() ([]byte, error) {
+	return Quote(u.String()), nil
 }
 
 // Size implements the keybase/kbfs/cache.Measurable interface.
@@ -992,7 +1150,7 @@ func WrapError(e error) interface{} {
 var _ rpc.WrapErrorFunc = WrapError
 
 // ErrorUnwrapper is converter that take a Status object off the wire and convert it
-// into an Error that Go can understand, and you can descriminate on in your code.
+// into an Error that Go can understand, and you can discriminate on in your code.
 // Though status object can act as Go errors, you can further convert them into
 // typed errors via the Upcaster function if specified. An Upcaster takes a Status
 // and returns something that obeys the Error interface, but can be anything your
@@ -1061,7 +1219,8 @@ func (b TLFIdentifyBehavior) AlwaysRunIdentify() bool {
 	case TLFIdentifyBehavior_CHAT_CLI,
 		TLFIdentifyBehavior_CHAT_GUI,
 		TLFIdentifyBehavior_CHAT_GUI_STRICT,
-		TLFIdentifyBehavior_SALTPACK:
+		TLFIdentifyBehavior_SALTPACK,
+		TLFIdentifyBehavior_KBFS_CHAT:
 		return true
 	default:
 		return false
@@ -1072,7 +1231,8 @@ func (b TLFIdentifyBehavior) CanUseUntrackedFastPath() bool {
 	switch b {
 	case TLFIdentifyBehavior_CHAT_GUI,
 		TLFIdentifyBehavior_CHAT_GUI_STRICT,
-		TLFIdentifyBehavior_SALTPACK:
+		TLFIdentifyBehavior_SALTPACK,
+		TLFIdentifyBehavior_RESOLVE_AND_CHECK:
 		return true
 	default:
 		// TLFIdentifyBehavior_DEFAULT_KBFS, for filesystem activity that
@@ -1093,6 +1253,36 @@ func (b TLFIdentifyBehavior) WarningInsteadOfErrorOnBrokenTracks() bool {
 	}
 }
 
+func (b TLFIdentifyBehavior) SkipUserCard() bool {
+	switch b {
+	case TLFIdentifyBehavior_CHAT_GUI, TLFIdentifyBehavior_RESOLVE_AND_CHECK:
+		// We don't need to bother loading a user card in these cases.
+		return true
+	default:
+		return false
+	}
+}
+
+func (b TLFIdentifyBehavior) AllowCaching() bool {
+	switch b {
+	case TLFIdentifyBehavior_RESOLVE_AND_CHECK:
+		// We Don't want to use any internal ID2 caching for ResolveAndCheck.
+		return false
+	default:
+		return true
+	}
+}
+
+func (b TLFIdentifyBehavior) AllowDeletedUsers() bool {
+	switch b {
+	case TLFIdentifyBehavior_RESOLVE_AND_CHECK:
+		// ResolveAndCheck is OK with deleted users
+		return true
+	default:
+		return false
+	}
+}
+
 // All of the chat modes want to prevent tracker popups.
 func (b TLFIdentifyBehavior) ShouldSuppressTrackerPopups() bool {
 	switch b {
@@ -1101,7 +1291,9 @@ func (b TLFIdentifyBehavior) ShouldSuppressTrackerPopups() bool {
 		TLFIdentifyBehavior_CHAT_CLI,
 		TLFIdentifyBehavior_KBFS_REKEY,
 		TLFIdentifyBehavior_KBFS_QR,
-		TLFIdentifyBehavior_SALTPACK:
+		TLFIdentifyBehavior_SALTPACK,
+		TLFIdentifyBehavior_RESOLVE_AND_CHECK,
+		TLFIdentifyBehavior_KBFS_CHAT:
 		// These are identifies that either happen without user interaction at
 		// all, or happen while you're staring at some Keybase UI that can
 		// report errors on its own. No popups needed.
@@ -1165,17 +1357,12 @@ func (u UserPlusKeys) GetStatus() StatusCode {
 	return u.Status
 }
 
-func (u UserPlusAllKeys) GetRemoteTrack(s string) *RemoteTrack {
-	i := sort.Search(len(u.RemoteTracks), func(j int) bool {
-		return u.RemoteTracks[j].Username >= s
-	})
-	if i >= len(u.RemoteTracks) {
+func (u UserPlusKeysV2AllIncarnations) GetRemoteTrack(uid UID) *RemoteTrack {
+	ret, ok := u.Current.RemoteTracks[uid]
+	if !ok {
 		return nil
 	}
-	if u.RemoteTracks[i].Username != s {
-		return nil
-	}
-	return &u.RemoteTracks[i]
+	return &ret
 }
 
 func (u UserPlusAllKeys) GetUID() UID {
@@ -1229,6 +1416,22 @@ func (u UserPlusAllKeys) FindDevice(d DeviceID) *PublicKey {
 	return nil
 }
 
+func (u UserPlusKeysV2) GetUID() UID {
+	return u.Uid
+}
+
+func (u UserPlusKeysV2) GetName() string {
+	return u.Username
+}
+
+func (u UserPlusKeysV2) GetStatus() StatusCode {
+	return u.Status
+}
+
+func (u UserPlusKeysV2AllIncarnations) ExportToSimpleUser() User {
+	return User{Uid: u.GetUID(), Username: u.GetName()}
+}
+
 func (u UserPlusKeysV2AllIncarnations) FindDevice(d DeviceID) *PublicKeyV2NaCl {
 	for _, k := range u.Current.DeviceKeys {
 		if k.DeviceID.Eq(d) {
@@ -1236,6 +1439,24 @@ func (u UserPlusKeysV2AllIncarnations) FindDevice(d DeviceID) *PublicKeyV2NaCl {
 		}
 	}
 	return nil
+}
+
+func (u UserPlusKeysV2AllIncarnations) GetUID() UID {
+	return u.Current.GetUID()
+}
+
+func (u UserPlusKeysV2AllIncarnations) GetName() string {
+	return u.Current.GetName()
+}
+
+func (u UserPlusKeysV2AllIncarnations) GetStatus() StatusCode {
+	return u.Current.GetStatus()
+}
+
+func (u UserPlusKeysV2AllIncarnations) AllIncarnations() (ret []UserPlusKeysV2) {
+	ret = append(ret, u.Current)
+	ret = append(ret, u.PastIncarnations...)
+	return ret
 }
 
 func (u UserPlusKeys) FindKID(needle KID) *PublicKey {
@@ -1265,6 +1486,13 @@ func (u UserPlusKeysV2AllIncarnations) FindKID(kid KID) (*UserPlusKeysV2, *Publi
 	return nil, nil
 }
 
+// HasKID returns true if u has the given KID in any of its incarnations.
+// Useful for deciding if we should repoll a stale UPAK in the UPAK loader.
+func (u UserPlusKeysV2AllIncarnations) HasKID(kid KID) bool {
+	incarnation, _ := u.FindKID(kid)
+	return (incarnation != nil)
+}
+
 func (u UserPlusKeysV2) FindDeviceKey(needle KID) *PublicKeyV2NaCl {
 	for _, k := range u.DeviceKeys {
 		if k.Base.Kid.Equal(needle) {
@@ -1272,6 +1500,48 @@ func (u UserPlusKeysV2) FindDeviceKey(needle KID) *PublicKeyV2NaCl {
 		}
 	}
 	return nil
+}
+
+func (u UserPlusKeysV2) FindSigningDeviceKey(d DeviceID) *PublicKeyV2NaCl {
+	for _, k := range u.DeviceKeys {
+		if k.DeviceID.Eq(d) && k.Base.IsSibkey {
+			return &k
+		}
+	}
+	return nil
+}
+
+func (u UserPlusKeysV2) FindSigningDeviceKID(d DeviceID) (KID, string) {
+	key := u.FindSigningDeviceKey(d)
+	if key == nil {
+		return KID(""), ""
+	}
+	return key.Base.Kid, key.DeviceDescription
+}
+
+func (u UserPlusKeysV2) FindEncryptionDeviceKeyFromSigningKID(parent KID) *PublicKeyV2NaCl {
+	for _, k := range u.DeviceKeys {
+		if !k.Base.IsSibkey && k.Parent != nil && k.Parent.Equal(parent) {
+			return &k
+		}
+	}
+	return nil
+}
+
+func (u UserPlusKeysV2) FindEncryptionKIDFromSigningKID(parent KID) KID {
+	key := u.FindEncryptionDeviceKeyFromSigningKID(parent)
+	if key == nil {
+		return KID("")
+	}
+	return key.Base.Kid
+}
+
+func (u UserPlusKeysV2) FindEncryptionKIDFromDeviceID(deviceID DeviceID) KID {
+	signingKID, _ := u.FindSigningDeviceKID(deviceID)
+	if signingKID.IsNil() {
+		return KID("")
+	}
+	return u.FindEncryptionKIDFromSigningKID(signingKID)
 }
 
 func (s ChatConversationID) String() string {
@@ -1526,6 +1796,7 @@ func UPAKFromUPKV2AI(uV2 UserPlusKeysV2AllIncarnations) UserPlusAllKeys {
 	// Convert the device keys.
 	var deviceKeysV1 []PublicKey
 	var revokedDeviceKeysV1 []RevokedKey
+	var resets []ResetSummary
 	for _, keyV2 := range uV2.Current.DeviceKeys {
 		if keyV2.Base.Revocation != nil {
 			revokedDeviceKeysV1 = append(revokedDeviceKeysV1, RevokedKeyV1FromDeviceKeyV2(keyV2))
@@ -1541,6 +1812,9 @@ func UPAKFromUPKV2AI(uV2 UserPlusKeysV2AllIncarnations) UserPlusAllKeys {
 	for _, incarnation := range uV2.PastIncarnations {
 		for _, keyV2 := range incarnation.DeviceKeys {
 			deletedDeviceKeysV1 = append(deletedDeviceKeysV1, PublicKeyV1FromDeviceKeyV2(keyV2))
+		}
+		if reset := incarnation.Reset; reset != nil {
+			resets = append(resets, *reset)
 		}
 	}
 	sort.Slice(deletedDeviceKeysV1, func(i, j int) bool { return deletedDeviceKeysV1[i].KID < deletedDeviceKeysV1[j].KID })
@@ -1566,6 +1840,7 @@ func UPAKFromUPKV2AI(uV2 UserPlusKeysV2AllIncarnations) UserPlusAllKeys {
 			PGPKeyCount:       len(pgpKeysV1),
 			Uvv:               uV2.Uvv,
 			PerUserKeys:       uV2.Current.PerUserKeys,
+			Resets:            resets,
 		},
 		PGPKeys:      pgpKeysV1,
 		RemoteTracks: remoteTracks,
@@ -1574,6 +1849,13 @@ func UPAKFromUPKV2AI(uV2 UserPlusKeysV2AllIncarnations) UserPlusAllKeys {
 
 func (u UserVersionPercentForm) String() string {
 	return string(u)
+}
+
+func NewUserVersion(uid UID, eldestSeqno Seqno) UserVersion {
+	return UserVersion{
+		Uid:         uid,
+		EldestSeqno: eldestSeqno,
+	}
 }
 
 func (u UserVersion) PercentForm() UserVersionPercentForm {
@@ -1662,8 +1944,25 @@ func (t TeamMembers) AllUserVersions() []UserVersion {
 	return all
 }
 
-func (t TeamMember) IsReset() bool {
-	return t.EldestSeqno != t.UserEldestSeqno
+func (s TeamMemberStatus) IsActive() bool {
+	return s == TeamMemberStatus_ACTIVE
+}
+
+func (s TeamMemberStatus) IsReset() bool {
+	return s == TeamMemberStatus_RESET
+}
+
+func (s TeamMemberStatus) IsDeleted() bool {
+	return s == TeamMemberStatus_DELETED
+}
+
+func FilterInactiveMembers(arg []TeamMemberDetails) (ret []TeamMemberDetails) {
+	for _, v := range arg {
+		if v.Status.IsActive() {
+			ret = append(ret, v)
+		}
+	}
+	return ret
 }
 
 func (t TeamName) IsNil() bool {
@@ -1855,12 +2154,30 @@ func (u UserPlusKeysV2) ToUserVersion() UserVersion {
 	}
 }
 
+func (u UserPlusKeysV2AllIncarnations) ToUserVersion() UserVersion {
+	return u.Current.ToUserVersion()
+}
+
 // Can return nil.
 func (u UserPlusKeysV2) GetLatestPerUserKey() *PerUserKey {
 	if len(u.PerUserKeys) > 0 {
 		return &u.PerUserKeys[len(u.PerUserKeys)-1]
 	}
 	return nil
+}
+
+// Can return nil.
+func (u UserPlusKeysV2) GetPerUserKeyByGen(gen PerUserKeyGeneration) *PerUserKey {
+	genint := int(gen)
+	if genint <= 0 || genint > len(u.PerUserKeys) {
+		return nil
+	}
+	puk := u.PerUserKeys[genint-1]
+	if puk.Gen != genint {
+		// The PerUserKeys field of this object is malformed
+		return nil
+	}
+	return &puk
 }
 
 func (s PerTeamKeySeed) ToBytes() []byte { return s[:] }
@@ -1885,6 +2202,20 @@ func (s SigChainLocation) Eq(s2 SigChainLocation) bool {
 
 func (s SigChainLocation) LessThanOrEqualTo(s2 SigChainLocation) bool {
 	return s.SeqType == s2.SeqType && s.Seqno <= s2.Seqno
+}
+
+func (s SigChainLocation) Comparable(s2 SigChainLocation) error {
+	if s.SeqType != s2.SeqType {
+		return fmt.Errorf("mismatched seqtypes: %v != %v", s.SeqType, s2.SeqType)
+	}
+	return nil
+}
+
+func (s SigChainLocation) Sub1() SigChainLocation {
+	return SigChainLocation{
+		Seqno:   s.Seqno - 1,
+		SeqType: s.SeqType,
+	}
 }
 
 func (r TeamRole) IsAdminOrAbove() bool {
@@ -2087,6 +2418,11 @@ func (t TLFVisibility) Eq(r TLFVisibility) bool {
 func ParseUserVersion(s UserVersionPercentForm) (res UserVersion, err error) {
 	parts := strings.Split(string(s), "%")
 	if len(parts) == 1 {
+		// NOTE: We have to keep it the way it is, even though we
+		// never save UIDs without EldestSeqno anywhere. There may be
+		// team chain which have UVs encoded with default eldest=1 in
+		// the wild.
+
 		// default to seqno 1
 		parts = append(parts, "1")
 	}
@@ -2145,6 +2481,21 @@ func (req *TeamChangeReq) AddUVWithRole(uv UserVersion, role TeamRole) error {
 	return nil
 }
 
+func (req *TeamChangeReq) CompleteInviteID(inviteID TeamInviteID, uv UserVersionPercentForm) {
+	if req.CompletedInvites == nil {
+		req.CompletedInvites = make(map[TeamInviteID]UserVersionPercentForm)
+	}
+	req.CompletedInvites[inviteID] = uv
+}
+
+func (req *TeamChangeReq) GetAllAdds() (ret []UserVersion) {
+	ret = append(ret, req.Readers...)
+	ret = append(ret, req.Writers...)
+	ret = append(ret, req.Admins...)
+	ret = append(ret, req.Owners...)
+	return ret
+}
+
 func TotalNumberOfCommits(refs []GitRefMetadata) (total int) {
 	for _, ref := range refs {
 		total += len(ref.Commits)
@@ -2178,4 +2529,55 @@ func (e TeamEncryptedKBFSKeysetHash) Bytes() []byte {
 
 func (e TeamEncryptedKBFSKeysetHash) SecureEqual(l TeamEncryptedKBFSKeysetHash) bool {
 	return hmac.Equal(e.Bytes(), l.Bytes())
+}
+
+func (r ResetLink) Summarize() ResetSummary {
+	return ResetSummary{
+		Ctime:      r.Ctime,
+		MerkleRoot: r.MerkleRoot,
+		ResetSeqno: r.ResetSeqno,
+		Type:       r.Type,
+	}
+}
+
+func (f AvatarFormat) String() string {
+	return string(f)
+}
+
+func (u AvatarUrl) String() string {
+	return string(u)
+}
+
+func MakeAvatarURL(u string) AvatarUrl {
+	return AvatarUrl(u)
+}
+
+func (b Bytes32) IsBlank() bool {
+	var blank Bytes32
+	return (subtle.ConstantTimeCompare(b[:], blank[:]) == 1)
+}
+
+func (i Identify2ResUPK2) ExportToV1() Identify2Res {
+	return Identify2Res{
+		Upk:          UPAKFromUPKV2AI(i.Upk).Base,
+		IdentifiedAt: i.IdentifiedAt,
+		TrackBreaks:  i.TrackBreaks,
+	}
+}
+
+func (path Path) String() string {
+	pathType, err := path.PathType()
+	if err != nil {
+		return ""
+	}
+	switch pathType {
+	case PathType_KBFS:
+		return path.Kbfs()
+	case PathType_KBFS_ARCHIVED:
+		return path.KbfsArchived().Path
+	case PathType_LOCAL:
+		return path.Local()
+	default:
+		return ""
+	}
 }

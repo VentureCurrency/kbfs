@@ -5,11 +5,10 @@
 package libkbfs
 
 import (
-	"time"
-
 	"github.com/golang/mock/gomock"
 	"github.com/keybase/client/go/logger"
 	"github.com/keybase/kbfs/kbfscodec"
+	"github.com/keybase/kbfs/kbfsedits"
 	"golang.org/x/net/context"
 )
 
@@ -50,6 +49,7 @@ type ConfigMock struct {
 	mockBcache      *MockBlockCache
 	mockDirtyBcache *MockDirtyBlockCache
 	mockCrypto      *MockCrypto
+	mockChat        *MockChat
 	mockCodec       *kbfscodec.MockCodec
 	mockMdops       *MockMDOps
 	mockKops        *MockKeyOps
@@ -93,6 +93,8 @@ func NewConfigMock(c *gomock.Controller, ctr *SafeTestReporter) *ConfigMock {
 	config.SetDirtyBlockCache(config.mockDirtyBcache)
 	config.mockCrypto = NewMockCrypto(c)
 	config.SetCrypto(config.mockCrypto)
+	config.mockChat = NewMockChat(c)
+	config.SetChat(config.mockChat)
 	config.mockCodec = kbfscodec.NewMockCodec(c)
 	config.mockCodec.EXPECT().RegisterType(gomock.Any(), gomock.Any()).
 		AnyTimes().Return()
@@ -121,6 +123,7 @@ func NewConfigMock(c *gomock.Controller, ctr *SafeTestReporter) *ConfigMock {
 	config.SetClock(config.mockClock)
 	config.mockRekeyQueue = NewMockRekeyQueue(c)
 	config.SetRekeyQueue(config.mockRekeyQueue)
+	config.SetUserHistory(kbfsedits.NewUserHistory())
 	config.observer = &FakeObserver{}
 	config.ctr = ctr
 	// turn off background flushing by default during tests
@@ -130,9 +133,8 @@ func NewConfigMock(c *gomock.Controller, ctr *SafeTestReporter) *ConfigMock {
 	config.maxDirBytes = maxDirBytesDefault
 	config.rwpWaitTime = rekeyWithPromptWaitTimeDefault
 
-	config.qrPeriod = 0 * time.Second // no auto reclamation
-	config.qrUnrefAge = qrUnrefAgeDefault
 	config.SetMetadataVersion(defaultClientMetadataVer)
+	config.mode = modeTest{NewInitModeFromType(InitDefault)}
 
 	return config
 }

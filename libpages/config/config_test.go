@@ -12,14 +12,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseConfig(t *testing.T) {
+func TestParseConfigV1(t *testing.T) {
 	config := &V1{
 		Common: Common{
 			Version: Version1Str,
 		},
 		Users: map[string]string{
-			"alice": string(generatePasswordHashForTestOrBust(t, "12345")),
-			"bob":   string(generatePasswordHashForTestOrBust(t, "54321")),
+			"alice": string(generateBcryptPasswordHashForTestOrBust(t, "12345")),
+			"bob":   string(generateSHA256PasswordHashForTestOrBust(t, "54321")),
 		},
 		ACLs: map[string]AccessControlV1{
 			"/alice-and-bob": AccessControlV1{

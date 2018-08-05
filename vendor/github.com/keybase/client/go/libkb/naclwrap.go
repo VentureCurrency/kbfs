@@ -23,7 +23,7 @@ type NaclSigInfo struct {
 	Kid      keybase1.BinaryKID `codec:"key"`
 	Payload  []byte             `codec:"payload,omitempty"`
 	Sig      NaclSignature      `codec:"sig"`
-	SigType  int                `codec:"sig_type"`
+	SigType  AlgoType           `codec:"sig_type"`
 	HashType int                `codec:"hash_type"`
 	Detached bool               `codec:"detached"`
 	Version  int                `codec:"version,omitempty"`
@@ -31,11 +31,11 @@ type NaclSigInfo struct {
 }
 
 type NaclEncryptionInfo struct {
-	Ciphertext     []byte `codec:"ciphertext"`
-	EncryptionType int    `codec:"enc_type"`
-	Nonce          []byte `codec:"nonce"`
-	Receiver       []byte `codec:"receiver_key"`
-	Sender         []byte `codec:"sender_key"`
+	Ciphertext     []byte   `codec:"ciphertext"`
+	EncryptionType AlgoType `codec:"enc_type"`
+	Nonce          []byte   `codec:"nonce"`
+	Receiver       []byte   `codec:"receiver_key"`
+	Sender         []byte   `codec:"sender_key"`
 }
 
 const NaclDHKeysize = 32
@@ -91,6 +91,11 @@ func (k NaclDHKeyPair) Clone() (ret NaclDHKeyPair) {
 var _ GenericKey = NaclDHKeyPair{}
 
 type NaclSecretBoxKey [NaclSecretBoxKeySize]byte
+
+func (k NaclSecretBoxKey) IsZero() bool {
+	var z NaclSecretBoxKey
+	return hmac.Equal(k[:], z[:])
+}
 
 func importNaclHex(s string, typ byte, bodyLen int) (ret []byte, err error) {
 	kid := keybase1.KIDFromString(s)
@@ -161,6 +166,18 @@ func ImportKeypairFromKID(k keybase1.KID) (key GenericKey, err error) {
 		err = BadKeyError{fmt.Sprintf("Bad key prefix: %d", kid[1])}
 	}
 	return
+}
+
+func ImportDHKeypairFromKID(k keybase1.KID) (*NaclDHKeyPair, error) {
+	genericKey, err := ImportKeypairFromKID(k)
+	if err != nil {
+		return nil, err
+	}
+	naclKey, ok := genericKey.(NaclDHKeyPair)
+	if !ok {
+		return nil, fmt.Errorf("expected NaclDHKeyPair, got %T", genericKey)
+	}
+	return &naclKey, nil
 }
 
 func ImportNaclSigningKeyPairFromHex(s string) (ret NaclSigningKeyPair, err error) {
@@ -905,4 +922,15 @@ func GeneratePerUserKeySeed() (res PerUserKeySeed, err error) {
 	}
 	seed := PerUserKeySeed(MakeByte32(bs))
 	return seed, nil
+}
+
+func RandomNaclDHNonce() (nonce [NaclDHNonceSize]byte, err error) {
+	nRead, err := rand.Read(nonce[:])
+	if err != nil {
+		return nonce, err
+	}
+	if nRead != NaclDHNonceSize {
+		return nonce, fmt.Errorf("Short random read: %d", nRead)
+	}
+	return nonce, nil
 }

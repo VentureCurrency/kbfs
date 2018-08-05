@@ -454,7 +454,7 @@ type rekeyFSM struct {
 // NewRekeyFSM creates a new rekey FSM.
 func NewRekeyFSM(fbo *folderBranchOps) RekeyFSM {
 	fsm := &rekeyFSM{
-		reqs:       make(chan RekeyEvent, rekeyQueueSize),
+		reqs:       make(chan RekeyEvent, fbo.config.Mode().RekeyQueueSize()),
 		shutdownCh: make(chan struct{}),
 		fbo:        fbo,
 		log:        fbo.config.MakeLogger("RekeyFSM"),
@@ -462,7 +462,9 @@ func NewRekeyFSM(fbo *folderBranchOps) RekeyFSM {
 		listeners: make(map[rekeyEventType][]rekeyFSMListener),
 	}
 	fsm.current = newRekeyStateIdle(fsm)
-	go fsm.loop()
+	if fbo.bType == standard {
+		go fsm.loop()
+	}
 	return fsm
 }
 

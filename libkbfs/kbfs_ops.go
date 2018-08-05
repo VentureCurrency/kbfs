@@ -9,10 +9,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/logger"
+	"github.com/keybase/client/go/protocol/chat1"
 	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/kbfs/kbfscrypto"
+	"github.com/keybase/kbfs/kbfsedits"
 	"github.com/keybase/kbfs/kbfsmd"
+	"github.com/keybase/kbfs/kbfssync"
 	"github.com/keybase/kbfs/tlf"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -22,6 +26,7 @@ import (
 // safe by forwarding requests to individual per-folder-branch
 // handlers that are go-routine-safe.
 type KBFSOpsStandard struct {
+	g        *libkb.GlobalContext
 	config   Config
 	log      logger.Logger
 	deferLog logger.Logger
@@ -37,6 +42,10 @@ type KBFSOpsStandard struct {
 
 	favs *Favorites
 
+	editActivity kbfssync.RepeatedWaitGroup
+	editLock     sync.Mutex
+	editShutdown bool
+
 	currentStatus            kbfsCurrentStatus
 	quotaUsage               *EventuallyConsistentQuotaUsage
 	longOperationDebugDumper *ImpatientDebugDumper
@@ -47,9 +56,11 @@ var _ KBFSOps = (*KBFSOpsStandard)(nil)
 const longOperationDebugDumpDuration = time.Minute
 
 // NewKBFSOpsStandard constructs a new KBFSOpsStandard object.
-func NewKBFSOpsStandard(config Config) *KBFSOpsStandard {
+func NewKBFSOpsStandard(
+	g *libkb.GlobalContext, config Config) *KBFSOpsStandard {
 	log := config.MakeLogger("")
 	kops := &KBFSOpsStandard{
+		g:                     g,
 		config:                config,
 		log:                   log,
 		deferLog:              log.CloneWithAddedDepth(1),
@@ -108,12 +119,29 @@ func (fs *KBFSOpsStandard) markForReIdentifyIfNeeded(
 	}
 }
 
+func (fs *KBFSOpsStandard) shutdownEdits(ctx context.Context) error {
+	fs.editLock.Lock()
+	fs.editShutdown = true
+	fs.editLock.Unlock()
+
+	err := fs.editActivity.Wait(ctx)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // Shutdown safely shuts down any background goroutines that may have
 // been launched by KBFSOpsStandard.
 func (fs *KBFSOpsStandard) Shutdown(ctx context.Context) error {
 	defer fs.longOperationDebugDumper.Shutdown() // shut it down last
 	timeTrackerDone := fs.longOperationDebugDumper.Begin(ctx)
 	defer timeTrackerDone()
+
+	err := fs.shutdownEdits(ctx)
+	if err != nil {
+		return err
+	}
 
 	close(fs.reIdentifyControlChan)
 	var errors []error
@@ -139,11 +167,38 @@ func (fs *KBFSOpsStandard) Shutdown(ctx context.Context) error {
 func (fs *KBFSOpsStandard) PushConnectionStatusChange(
 	service string, newStatus error) {
 	fs.currentStatus.PushConnectionStatusChange(service, newStatus)
+
+	if fs.config.KeybaseService() == nil {
+		return
+	}
+
+	switch service {
+	case KeybaseServiceName, GregorServiceName:
+	default:
+		return
+	}
+
+	fs.opsLock.Lock()
+	defer fs.opsLock.Unlock()
+
+	for _, fbo := range fs.ops {
+		fbo.PushConnectionStatusChange(service, newStatus)
+	}
+
+	if newStatus == nil {
+		fs.log.CDebugf(nil, "Asking for an edit re-init after reconnection")
+		fs.editActivity.Add(1)
+		go fs.initTlfsForEditHistories()
+	}
 }
 
 // PushStatusChange forces a new status be fetched by status listeners.
 func (fs *KBFSOpsStandard) PushStatusChange() {
 	fs.currentStatus.PushStatusChange()
+
+	fs.log.CDebugf(nil, "Asking for an edit re-init after status change")
+	fs.editActivity.Add(1)
+	go fs.initTlfsForEditHistories()
 }
 
 // ClearPrivateFolderMD implements the KBFSOps interface for
@@ -277,12 +332,25 @@ func (fs *KBFSOpsStandard) getOpsNoAdd(
 	// look it up again in case someone else got the lock
 	ops, ok := fs.ops[fb]
 	if !ok {
-		// TODO: add some interface for specifying the type of the
-		// branch; for now assume online and read-write.
-		ops = newFolderBranchOps(ctx, fs.config, fb, standard)
+		bType := standard
+		if _, isRevBranch := fb.Branch.RevisionIfSpecified(); isRevBranch {
+			bType = archive
+		}
+		ops = newFolderBranchOps(ctx, fs.g, fs.config, fb, bType)
 		fs.ops[fb] = ops
 	}
 	return ops
+}
+
+func (fs *KBFSOpsStandard) getOpsIfExists(
+	ctx context.Context, fb FolderBranch) *folderBranchOps {
+	if fb == (FolderBranch{}) {
+		panic("zero FolderBranch in getOps")
+	}
+
+	fs.opsLock.RLock()
+	defer fs.opsLock.RUnlock()
+	return fs.ops[fb]
 }
 
 func (fs *KBFSOpsStandard) getOps(ctx context.Context,
@@ -369,7 +437,7 @@ func (fs *KBFSOpsStandard) createAndStoreTlfIDIfNeeded(
 }
 
 func (fs *KBFSOpsStandard) getOrInitializeNewMDMaster(ctx context.Context,
-	mdops MDOps, h *TlfHandle, create bool, fop FavoritesOp) (
+	mdops MDOps, h *TlfHandle, fb FolderBranch, create bool, fop FavoritesOp) (
 	initialized bool, md ImmutableRootMetadata, id tlf.ID, err error) {
 	defer func() {
 		if getExtendedIdentify(ctx).behavior.AlwaysRunIdentify() &&
@@ -387,6 +455,34 @@ func (fs *KBFSOpsStandard) getOrInitializeNewMDMaster(ctx context.Context,
 		return false, ImmutableRootMetadata{}, tlf.NullID, err
 	}
 
+	if rev, isRevBranch := fb.Branch.RevisionIfSpecified(); isRevBranch {
+		fs.log.CDebugf(ctx, "Getting archived revision %d for branch %s",
+			rev, fb.Branch)
+
+		// Make sure that rev hasn't been garbage-collected yet.
+		rmd, err := fs.getMDByHandle(ctx, h, FavoritesOpNoChange)
+		if err != nil {
+			return false, ImmutableRootMetadata{}, tlf.NullID, err
+		}
+		if rmd != (ImmutableRootMetadata{}) && rmd.IsReadable() {
+			if rev <= rmd.data.LastGCRevision {
+				return false, ImmutableRootMetadata{}, tlf.NullID,
+					RevGarbageCollectedError{rev, rmd.data.LastGCRevision}
+			}
+		}
+
+		md, err = getSingleMD(
+			ctx, fs.config, h.tlfID, kbfsmd.NullBranchID, rev,
+			kbfsmd.Merged, nil)
+		// This will error if there's no corresponding MD, which is
+		// what we want since that means the user input an incorrect
+		// MD revision.
+		if err != nil {
+			return false, ImmutableRootMetadata{}, tlf.NullID, err
+		}
+		return false, md, h.tlfID, nil
+	}
+
 	md, err = mdops.GetForTLF(ctx, h.tlfID, nil)
 	if err != nil {
 		return false, ImmutableRootMetadata{}, tlf.NullID, err
@@ -400,10 +496,7 @@ func (fs *KBFSOpsStandard) getOrInitializeNewMDMaster(ctx context.Context,
 	}
 
 	// Init new MD.
-
-	fb := FolderBranch{Tlf: h.tlfID, Branch: MasterBranch}
 	fops := fs.getOpsByHandle(ctx, h, fb, fop)
-
 	err = fops.SetInitialHeadToNew(ctx, h.tlfID, h)
 	// Someone else initialized the TLF out from under us, so we
 	// didn't initialize it.
@@ -440,11 +533,8 @@ func (fs *KBFSOpsStandard) getMDByHandle(ctx context.Context,
 		return ImmutableRootMetadata{}, err
 	}
 
-	// Check for an unmerged MD first, unless we're in single-op
-	// mode.  If this is a single-op, we can skip this check because
-	// there's basically no way for a TLF to start off as unmerged
-	// since single-ops should be using a fresh journal.
-	if fs.config.Mode() != InitSingleOp {
+	// Check for an unmerged MD first if necessary.
+	if fs.config.Mode().UnmergedTLFsEnabled() {
 		rmd, err = fs.config.MDOps().GetUnmergedForTLF(
 			ctx, tlfHandle.tlfID, kbfsmd.NullBranchID)
 		if err != nil {
@@ -452,13 +542,15 @@ func (fs *KBFSOpsStandard) getMDByHandle(ctx context.Context,
 		}
 	}
 
+	fb := FolderBranch{Tlf: tlfHandle.tlfID, Branch: MasterBranch}
 	if rmd == (ImmutableRootMetadata{}) {
 		if fop == FavoritesOpAdd {
 			_, rmd, _, err = fs.getOrInitializeNewMDMaster(
-				ctx, fs.config.MDOps(), tlfHandle, true, FavoritesOpAddNewlyCreated)
+				ctx, fs.config.MDOps(), tlfHandle, fb, true,
+				FavoritesOpAddNewlyCreated)
 		} else {
 			_, rmd, _, err = fs.getOrInitializeNewMDMaster(
-				ctx, fs.config.MDOps(), tlfHandle, true, fop)
+				ctx, fs.config.MDOps(), tlfHandle, fb, true, fop)
 		}
 		if err != nil {
 			return ImmutableRootMetadata{}, err
@@ -468,7 +560,6 @@ func (fs *KBFSOpsStandard) getMDByHandle(ctx context.Context,
 	// Make sure fbo exists and head is set so that next time we use this we
 	// don't need to hit server even when there isn't any FS activity.
 	if fbo == nil {
-		fb := FolderBranch{Tlf: rmd.TlfID(), Branch: MasterBranch}
 		fbo = fs.getOpsByHandle(ctx, tlfHandle, fb, fop)
 	}
 	if err = fbo.SetInitialHeadFromServer(ctx, rmd); err != nil {
@@ -531,19 +622,36 @@ func (fs *KBFSOpsStandard) getMaybeCreateRootNode(
 		h.GetCanonicalPath(), branch, create)
 	defer func() { fs.deferLog.CDebugf(ctx, "Done: %#v", err) }()
 
+	if branch != MasterBranch && create {
+		return nil, EntryInfo{}, errors.Errorf(
+			"Can't create a root node for branch %s", branch)
+	}
+
+	err = fs.createAndStoreTlfIDIfNeeded(ctx, h)
+	if err != nil {
+		return nil, EntryInfo{}, err
+	}
+
 	// Check if we already have the MD cached, before contacting any
 	// servers.
-	fops := fs.getOpsByFav(h.ToFavorite())
+	if h.tlfID == tlf.NullID {
+		return nil, EntryInfo{},
+			errors.Errorf("Handle for %s doesn't have a TLF ID set",
+				h.GetCanonicalPath())
+	}
+	fb := FolderBranch{Tlf: h.tlfID, Branch: branch}
+	fops := fs.getOpsIfExists(ctx, fb)
 	if fops != nil {
-		// If a folderBranchOps already exists for this TLF, use it to
-		// get the root node.  But if we haven't done an identify yet,
-		// we better do so, because `getRootNode()` doesn't do one.
+		// If a folderBranchOps has already been initialized for this TLF,
+		// use it to get the root node.  But if we haven't done an
+		// identify yet, we better do so, because `getRootNode()` doesn't
+		// do one.
 		lState := makeFBOLockState()
 		md, err := fops.getMDForReadNeedIdentifyOnMaybeFirstAccess(ctx, lState)
 		if err != nil {
 			return nil, EntryInfo{}, err
 		}
-		if md != (ImmutableRootMetadata{}) {
+		if md != (ImmutableRootMetadata{}) && md.IsReadable() {
 			node, ei, _, err := fops.getRootNode(ctx)
 			if err != nil {
 				return nil, EntryInfo{}, err
@@ -554,18 +662,10 @@ func (fs *KBFSOpsStandard) getMaybeCreateRootNode(
 		}
 	}
 
-	err = fs.createAndStoreTlfIDIfNeeded(ctx, h)
-	if err != nil {
-		return nil, EntryInfo{}, err
-	}
-
 	mdops := fs.config.MDOps()
 	var md ImmutableRootMetadata
-	// Check for an unmerged MD first, unless we're in single-op
-	// mode.  If this is a single-op, we can skip this check because
-	// there's basically no way for a TLF to start off as unmerged
-	// since single-ops should be using a fresh journal.
-	if fs.config.Mode() != InitSingleOp {
+	// Check for an unmerged MD first if necessary.
+	if fs.config.Mode().UnmergedTLFsEnabled() {
 		md, err = mdops.GetUnmergedForTLF(ctx, h.tlfID, kbfsmd.NullBranchID)
 		if err != nil {
 			return nil, EntryInfo{}, err
@@ -576,7 +676,7 @@ func (fs *KBFSOpsStandard) getMaybeCreateRootNode(
 		var id tlf.ID
 		var initialized bool
 		initialized, md, id, err = fs.getOrInitializeNewMDMaster(
-			ctx, mdops, h, create, FavoritesOpAdd)
+			ctx, mdops, h, fb, create, FavoritesOpAdd)
 		if err != nil {
 			return nil, EntryInfo{}, err
 		}
@@ -602,8 +702,6 @@ func (fs *KBFSOpsStandard) getMaybeCreateRootNode(
 			return nil, EntryInfo{}, nil
 		}
 	}
-
-	fb := FolderBranch{Tlf: md.TlfID(), Branch: branch}
 
 	// we might not be able to read the metadata if we aren't in the
 	// key group yet.
@@ -843,15 +941,16 @@ func (fs *KBFSOpsStandard) Status(ctx context.Context) (
 	defer timeTrackerDone()
 
 	session, err := fs.config.KBPKI().GetCurrentSession(ctx)
-	var usageBytes, limitBytes int64 = -1, -1
-	var gitUsageBytes, gitLimitBytes int64 = -1, -1
+	var usageBytes, archiveBytes, limitBytes int64 = -1, -1, -1
+	var gitUsageBytes, gitArchiveBytes, gitLimitBytes int64 = -1, -1, -1
 	// Don't request the quota info until we're sure we've
 	// authenticated with our password.  TODO: fix this in the
 	// service/GUI by handling multiple simultaneous passphrase
 	// requests at once.
 	if err == nil && fs.config.MDServer().IsConnected() {
 		var quErr error
-		_, usageBytes, limitBytes, gitUsageBytes, gitLimitBytes, quErr =
+		_, usageBytes, archiveBytes, limitBytes,
+			gitUsageBytes, gitArchiveBytes, gitLimitBytes, quErr =
 			fs.quotaUsage.GetAllTypes(ctx, 0, 0)
 		if quErr != nil {
 			// The error is ignored here so that other fields can still be populated
@@ -865,7 +964,7 @@ func (fs *KBFSOpsStandard) Status(ctx context.Context) (
 	if jErr == nil {
 		status, tlfIDs := jServer.Status(ctx)
 		jServerStatus = &status
-		err := fillInJournalStatusUnflushedPaths(
+		err := FillInJournalStatusUnflushedPaths(
 			ctx, fs.config, jServerStatus, tlfIDs)
 		if err != nil {
 			// The caller might depend on the channel (e.g., in
@@ -888,8 +987,10 @@ func (fs *KBFSOpsStandard) Status(ctx context.Context) (
 		CurrentUser:     session.Name.String(),
 		IsConnected:     fs.config.MDServer().IsConnected(),
 		UsageBytes:      usageBytes,
+		ArchiveBytes:    archiveBytes,
 		LimitBytes:      limitBytes,
 		GitUsageBytes:   gitUsageBytes,
+		GitArchiveBytes: gitArchiveBytes,
 		GitLimitBytes:   gitLimitBytes,
 		FailingServices: failures,
 		JournalServer:   jServerStatus,
@@ -940,11 +1041,9 @@ func (fs *KBFSOpsStandard) GetUpdateHistory(ctx context.Context,
 }
 
 // GetEditHistory implements the KBFSOps interface for KBFSOpsStandard
-func (fs *KBFSOpsStandard) GetEditHistory(ctx context.Context,
-	folderBranch FolderBranch) (edits TlfWriterEdits, err error) {
-	timeTrackerDone := fs.longOperationDebugDumper.Begin(ctx)
-	defer timeTrackerDone()
-
+func (fs *KBFSOpsStandard) GetEditHistory(
+	ctx context.Context, folderBranch FolderBranch) (
+	tlfHistory keybase1.FSFolderEditHistory, err error) {
 	ops := fs.getOps(ctx, folderBranch, FavoritesOpAdd)
 	return ops.GetEditHistory(ctx, folderBranch)
 }
@@ -959,13 +1058,8 @@ func (fs *KBFSOpsStandard) GetNodeMetadata(ctx context.Context, node Node) (
 	return ops.GetNodeMetadata(ctx, node)
 }
 
-// TeamNameChanged implements the KBFSOps interface for KBFSOpsStandard
-func (fs *KBFSOpsStandard) TeamNameChanged(
-	ctx context.Context, tid keybase1.TeamID) {
-	timeTrackerDone := fs.longOperationDebugDumper.Begin(ctx)
-	defer timeTrackerDone()
-
-	fs.log.CDebugf(ctx, "Got TeamNameChanged for %s", tid)
+func (fs *KBFSOpsStandard) findTeamByID(
+	ctx context.Context, tid keybase1.TeamID) *folderBranchOps {
 	fs.opsLock.Lock()
 	// Copy the ops list so we don't have to hold opsLock when calling
 	// `getRootNode()` (which can lead to deadlocks).
@@ -994,9 +1088,47 @@ func (fs *KBFSOpsStandard) TeamNameChanged(
 		}
 
 		fs.log.CDebugf(ctx, "Team name changed for team %s", tid)
-		go fbo.TeamNameChanged(ctx, tid)
-		break
+		return fbo
 	}
+	return nil
+}
+
+// TeamNameChanged implements the KBFSOps interface for KBFSOpsStandard
+func (fs *KBFSOpsStandard) TeamNameChanged(
+	ctx context.Context, tid keybase1.TeamID) {
+	timeTrackerDone := fs.longOperationDebugDumper.Begin(ctx)
+	defer timeTrackerDone()
+
+	fs.log.CDebugf(ctx, "Got TeamNameChanged for %s", tid)
+	fbo := fs.findTeamByID(ctx, tid)
+	if fbo != nil {
+		go fbo.TeamNameChanged(ctx, tid)
+	}
+}
+
+// TeamAbandoned implements the KBFSOps interface for KBFSOpsStandard.
+func (fs *KBFSOpsStandard) TeamAbandoned(
+	ctx context.Context, tid keybase1.TeamID) {
+	timeTrackerDone := fs.longOperationDebugDumper.Begin(ctx)
+	defer timeTrackerDone()
+
+	fs.log.CDebugf(ctx, "Got TeamAbandoned for %s", tid)
+	fbo := fs.findTeamByID(ctx, tid)
+	if fbo != nil {
+		go fbo.TeamAbandoned(ctx, tid)
+	}
+}
+
+// MigrateToImplicitTeam implements the KBFSOps interface for KBFSOpsStandard.
+func (fs *KBFSOpsStandard) MigrateToImplicitTeam(
+	ctx context.Context, id tlf.ID) error {
+	timeTrackerDone := fs.longOperationDebugDumper.Begin(ctx)
+	defer timeTrackerDone()
+
+	// We currently only migrate on the master branch of a TLF.
+	ops := fs.getOps(ctx,
+		FolderBranch{Tlf: id, Branch: MasterBranch}, FavoritesOpNoChange)
+	return ops.MigrateToImplicitTeam(ctx, id)
 }
 
 // KickoffAllOutstandingRekeys implements the KBFSOps interface for
@@ -1006,6 +1138,49 @@ func (fs *KBFSOpsStandard) KickoffAllOutstandingRekeys() error {
 		op.rekeyFSM.Event(newRekeyKickoffEvent())
 	}
 	return nil
+}
+
+// NewNotificationChannel implements the KBFSOps interface for
+// KBFSOpsStandard.
+func (fs *KBFSOpsStandard) NewNotificationChannel(
+	ctx context.Context, handle *TlfHandle, convID chat1.ConversationID,
+	channelName string) {
+	if !fs.config.Mode().TLFEditHistoryEnabled() {
+		return
+	}
+
+	fs.log.CDebugf(ctx, "New notification channel for %s",
+		handle.GetCanonicalPath())
+
+	// If the FBO already exists, notify it.  If the FBO doesn't exist
+	// yet, we need to create it, so that it shows up in the edit
+	// history.
+	fs.opsLock.Lock()
+	defer fs.opsLock.Unlock()
+	fav := handle.ToFavorite()
+	if ops, ok := fs.opsByFav[fav]; ok {
+		ops.NewNotificationChannel(ctx, handle, convID, channelName)
+	} else if handle.tlfID != tlf.NullID {
+		fs.editActivity.Add(1)
+		go func() {
+			defer fs.editActivity.Done()
+			fs.log.CDebugf(ctx, "Initializing TLF %s for the edit history",
+				handle.GetCanonicalPath())
+			ctx := CtxWithRandomIDReplayable(
+				context.Background(), CtxFBOIDKey, CtxFBOOpID, fs.log)
+			ops := fs.getOpsByHandle(
+				ctx, handle, FolderBranch{handle.tlfID, MasterBranch},
+				FavoritesOpNoChange)
+			// Don't initialize the entire TLF, because we don't want
+			// to run identifies on it.  Instead, just start the
+			// chat-monitoring part.
+			ops.startMonitorChat(handle.GetCanonicalName())
+		}()
+	} else {
+		fs.log.CWarningf(ctx,
+			"Handle %s for existing folder unexpectedly has no TLF ID",
+			handle.GetCanonicalName())
+	}
 }
 
 func (fs *KBFSOpsStandard) changeHandle(ctx context.Context,
@@ -1058,6 +1233,53 @@ func (fs *KBFSOpsStandard) onMDFlush(tlfID tlf.ID, bid kbfsmd.BranchID,
 	ops := fs.getOps(context.Background(),
 		FolderBranch{Tlf: tlfID, Branch: MasterBranch}, FavoritesOpNoChange)
 	ops.onMDFlush(bid, rev) // folderBranchOps makes a goroutine
+}
+
+func (fs *KBFSOpsStandard) initTlfsForEditHistories() {
+	defer fs.editActivity.Done()
+	shutdown := func() bool {
+		fs.editLock.Lock()
+		defer fs.editLock.Unlock()
+		return fs.editShutdown
+	}()
+	if shutdown {
+		return
+	}
+
+	if !fs.config.Mode().TLFEditHistoryEnabled() {
+		return
+	}
+
+	ctx := CtxWithRandomIDReplayable(
+		context.Background(), CtxFBOIDKey, CtxFBOOpID, fs.log)
+	fs.log.CDebugf(ctx, "Querying the kbfs-edits inbox for new TLFs")
+	handles, err := fs.config.Chat().GetGroupedInbox(
+		ctx, chat1.TopicType_KBFSFILEEDIT, kbfsedits.MaxClusters)
+	if err != nil {
+		fs.log.CWarningf(ctx, "Can't get inbox: %+v", err)
+		return
+	}
+
+	// Construct folderBranchOps instances for each TLF in the inbox
+	// that doesn't have one yet.  Also make sure there's one for the
+	// logged-in user's public folder.
+	for _, h := range handles {
+		if h.tlfID != tlf.NullID {
+			fs.log.CDebugf(ctx, "Initializing TLF %s (%s) for the edit history",
+				h.GetCanonicalPath(), h.tlfID)
+			ops := fs.getOpsByHandle(
+				ctx, h, FolderBranch{h.tlfID, MasterBranch},
+				FavoritesOpNoChange)
+			// Don't initialize the entire TLF, because we don't want
+			// to run identifies on it.  Instead, just start the
+			// chat-monitoring part.
+			ops.startMonitorChat(h.GetCanonicalName())
+		} else {
+			fs.log.CWarningf(ctx,
+				"Handle %s for existing folder unexpectedly has no TLF ID",
+				h.GetCanonicalName())
+		}
+	}
 }
 
 // kbfsOpsFavoriteObserver deals with a handle change for a particular

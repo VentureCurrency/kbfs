@@ -13,11 +13,13 @@ import (
 	"github.com/keybase/kbfs/libfs"
 	"github.com/keybase/kbfs/libkbfs"
 	"github.com/keybase/kbfs/tlf"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
 type fileOpener interface {
-	open(ctx context.Context, oc *openContext, path []string) (f dokan.File, isDir bool, err error)
+	open(ctx context.Context, oc *openContext, path []string) (
+		f dokan.File, cst dokan.CreateStatus, err error)
 	dokan.File
 }
 
@@ -67,7 +69,7 @@ func (fl *FolderList) addToFavorite(ctx context.Context, h *libkbfs.TlfHandle) (
 
 // open tries to open the correct thing. Following aliases and deferring to
 // Dir.open as necessary.
-func (fl *FolderList) open(ctx context.Context, oc *openContext, path []string) (f dokan.File, isDir bool, err error) {
+func (fl *FolderList) open(ctx context.Context, oc *openContext, path []string) (f dokan.File, cst dokan.CreateStatus, err error) {
 	fl.fs.log.CDebugf(ctx, "FL Lookup %#v type=%s upper=%v",
 		path, fl.tlfType, oc.isUppercasePath)
 	if len(path) == 0 {
@@ -91,7 +93,7 @@ func (fl *FolderList) open(ctx context.Context, oc *openContext, path []string) 
 
 		if name == "desktop.ini" || name == "DESKTOP.INI" {
 			fl.fs.log.CDebugf(ctx, "FL Lookup ignoring desktop.ini")
-			return nil, false, dokan.ErrObjectNameNotFound
+			return nil, 0, dokan.ErrObjectNameNotFound
 		}
 
 		var aliasTarget string
@@ -109,19 +111,19 @@ func (fl *FolderList) open(ctx context.Context, oc *openContext, path []string) 
 
 		if len(path) == 1 && isNewFolderName(name) {
 			if !oc.isCreateDirectory() {
-				return nil, false, dokan.ErrObjectNameNotFound
+				return nil, 0, dokan.ErrObjectNameNotFound
 			}
 			fl.fs.log.CDebugf(ctx, "FL Lookup creating EmptyFolder for Explorer")
 			e := &EmptyFolder{}
 			fl.lockedAddChild(name, e)
-			return e, true, nil
+			return e, dokan.NewDir, nil
 		}
 
 		if aliasTarget != "" {
 			fl.fs.log.CDebugf(ctx, "FL Lookup aliasCache hit: %q -> %q", name, aliasTarget)
 			if len(path) == 1 && oc.isOpenReparsePoint() {
 				// TODO handle dir/non-dir here, semantics?
-				return &Alias{canon: aliasTarget}, true, nil
+				return &Alias{canon: aliasTarget}, dokan.ExistingDir, nil
 			}
 			path[0] = aliasTarget
 			continue
@@ -130,17 +132,17 @@ func (fl *FolderList) open(ctx context.Context, oc *openContext, path []string) 
 		h, err := libfs.ParseTlfHandlePreferredQuick(
 			ctx, fl.fs.config.KBPKI(), name, fl.tlfType)
 		fl.fs.log.CDebugf(ctx, "FL Lookup continuing -> %v,%v", h, err)
-		switch err := err.(type) {
+		switch e := errors.Cause(err).(type) {
 		case nil:
 			// no error
 
 		case libkbfs.TlfNameNotCanonical:
 			// Only permit Aliases to targets that contain no errors.
-			aliasTarget = err.NameToTry
+			aliasTarget = e.NameToTry
 			fl.fs.log.CDebugf(ctx, "FL Lookup set alias: %q -> %q", name, aliasTarget)
 			if !fl.isValidAliasTarget(ctx, aliasTarget) {
 				fl.fs.log.CDebugf(ctx, "FL Refusing alias to non-valid target %q", aliasTarget)
-				return nil, false, dokan.ErrObjectNameNotFound
+				return nil, 0, dokan.ErrObjectNameNotFound
 			}
 			fl.mu.Lock()
 			fl.aliasCache[name] = aliasTarget
@@ -149,29 +151,29 @@ func (fl *FolderList) open(ctx context.Context, oc *openContext, path []string) 
 			if len(path) == 1 && oc.isOpenReparsePoint() {
 				// TODO handle dir/non-dir here, semantics?
 				fl.fs.log.CDebugf(ctx, "FL Lookup ret alias, oc: %#v", oc.CreateData)
-				return &Alias{canon: aliasTarget}, true, nil
+				return &Alias{canon: aliasTarget}, dokan.ExistingDir, nil
 			}
 			path[0] = aliasTarget
 			continue
 
 		case libkbfs.NoSuchNameError, libkbfs.BadTLFNameError:
-			return nil, false, dokan.ErrObjectNameNotFound
+			return nil, 0, dokan.ErrObjectNameNotFound
 
 		default:
 			// Some other error.
-			return nil, false, err
+			return nil, 0, err
 		}
 
 		fl.fs.log.CDebugf(ctx, "FL Lookup adding new child")
 		session, err := libkbfs.GetCurrentSessionIfPossible(ctx, fl.fs.config.KBPKI(), h.Type() == tlf.Public)
 		if err != nil {
-			return nil, false, err
+			return nil, 0, err
 		}
 		child = newTLF(fl, h, h.GetPreferredFormat(session.Name))
 		fl.lockedAddChild(name, child)
 		return child.open(ctx, oc, path[1:])
 	}
-	return nil, false, dokan.ErrObjectNameNotFound
+	return nil, 0, dokan.ErrObjectNameNotFound
 }
 
 func (fl *FolderList) forgetFolder(folderName string) {

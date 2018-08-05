@@ -9,10 +9,12 @@ import (
 
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/logger"
+	"github.com/keybase/client/go/protocol/chat1"
 	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/kbfs/kbfsblock"
 	"github.com/keybase/kbfs/kbfscodec"
 	"github.com/keybase/kbfs/kbfscrypto"
+	"github.com/keybase/kbfs/kbfsedits"
 	"github.com/keybase/kbfs/kbfsmd"
 	"github.com/keybase/kbfs/tlf"
 	metrics "github.com/rcrowley/go-metrics"
@@ -50,6 +52,10 @@ type cryptoPureGetter interface {
 
 type cryptoGetter interface {
 	Crypto() Crypto
+}
+
+type chatGetter interface {
+	Chat() Chat
 }
 
 type currentSessionGetterGetter interface {
@@ -384,12 +390,10 @@ type KBFSOps interface {
 	// outstanding writes from the local device.
 	GetUpdateHistory(ctx context.Context, folderBranch FolderBranch) (
 		history TLFUpdateHistory, err error)
-	// GetEditHistory returns a clustered list of the most recent file
-	// edits by each of the valid writers of the given folder.  users
-	// looking to get updates to this list can register as an observer
-	// for the folder.
+	// GetEditHistory returns the edit history of the TLF, clustered
+	// by writer.
 	GetEditHistory(ctx context.Context, folderBranch FolderBranch) (
-		edits TlfWriterEdits, err error)
+		tlfHistory keybase1.FSFolderEditHistory, err error)
 
 	// GetNodeMetadata gets metadata associated with a Node.
 	GetNodeMetadata(ctx context.Context, node Node) (NodeMetadata, error)
@@ -415,16 +419,34 @@ type KBFSOps interface {
 	// we should clean up any outstanding handle info associated with
 	// the team ID.
 	TeamNameChanged(ctx context.Context, tid keybase1.TeamID)
+	// TeamAbandoned indicates that a team has been abandoned, and
+	// shouldn't be referred to by its previous name anymore.
+	TeamAbandoned(ctx context.Context, tid keybase1.TeamID)
+	// MigrateToImplicitTeam migrates the given folder from a private-
+	// or public-keyed folder, to a team-keyed folder.  If it's
+	// already a private/public team-keyed folder, nil is returned.
+	MigrateToImplicitTeam(ctx context.Context, id tlf.ID) error
 	// KickoffAllOutstandingRekeys kicks off all outstanding rekeys. It does
 	// nothing to folders that have not scheduled a rekey. This should be
 	// called when we receive an event of "paper key cached" from service.
 	KickoffAllOutstandingRekeys() error
+	// NewNotificationChannel is called to notify any existing TLF
+	// matching `handle` that a new kbfs-edits channel is available.
+	NewNotificationChannel(
+		ctx context.Context, handle *TlfHandle, convID chat1.ConversationID,
+		channelName string)
 }
 
 type merkleRootGetter interface {
 	// GetCurrentMerkleRoot returns the current root of the global
 	// Keybase Merkle tree.
-	GetCurrentMerkleRoot(ctx context.Context) (keybase1.MerkleRootV2, error)
+	GetCurrentMerkleRoot(ctx context.Context) (
+		keybase1.MerkleRootV2, time.Time, error)
+	// VerifyMerkleRoot checks that the specified merkle root
+	// contains the given KBFS root; if not, it returns an error.
+	VerifyMerkleRoot(
+		ctx context.Context, root keybase1.MerkleRootV2,
+		kbfsRoot keybase1.KBFSRoot) error
 }
 
 type gitMetadataPutter interface {
@@ -492,12 +514,6 @@ type KeybaseService interface {
 	LoadUserPlusKeys(ctx context.Context,
 		uid keybase1.UID, pollForKID keybase1.KID) (UserInfo, error)
 
-	// LoadUnverifiedKeys returns a list of unverified public keys.  They are the union
-	// of all known public keys associated with the account and the currently verified
-	// keys currently part of the user's sigchain.
-	LoadUnverifiedKeys(ctx context.Context, uid keybase1.UID) (
-		[]keybase1.PublicKey, error)
-
 	// LoadTeamPlusKeys returns a TeamInfo struct for a team with the
 	// specified TeamID.  The caller can specify `desiredKeyGen` to
 	// force a server check if that particular key gen isn't yet
@@ -507,7 +523,8 @@ type KeybaseService interface {
 	// isn't a member of the team yet according to local caches; it
 	// may be set to "" if no server check is required.
 	LoadTeamPlusKeys(ctx context.Context, tid keybase1.TeamID,
-		desiredKeyGen kbfsmd.KeyGen, desiredUser keybase1.UserVersion,
+		tlfType tlf.Type, desiredKeyGen kbfsmd.KeyGen,
+		desiredUser keybase1.UserVersion, desiredKey kbfscrypto.VerifyingKey,
 		desiredRole keybase1.TeamRole) (TeamInfo, error)
 
 	// CurrentSession returns a SessionInfo struct with all the
@@ -527,6 +544,9 @@ type KeybaseService interface {
 	// Notify sends a filesystem notification.
 	Notify(ctx context.Context, notification *keybase1.FSNotification) error
 
+	// NotifyPathUpdated sends a path updated notification.
+	NotifyPathUpdated(ctx context.Context, path string) error
+
 	// NotifySyncStatus sends a sync status notification.
 	NotifySyncStatus(ctx context.Context,
 		status *keybase1.FSPathSyncStatus) error
@@ -537,10 +557,6 @@ type KeybaseService interface {
 	// just to force future calls loading this user to fall through to
 	// the daemon itself, rather than being served from the cache.
 	FlushUserFromLocalCache(ctx context.Context, uid keybase1.UID)
-
-	// FlushUserUnverifiedKeysFromLocalCache instructs this layer to clear any
-	// KBFS-side, locally-cached unverified keys for the given user.
-	FlushUserUnverifiedKeysFromLocalCache(ctx context.Context, uid keybase1.UID)
 
 	// TODO: Add CryptoClient methods, too.
 
@@ -557,8 +573,15 @@ type KeybaseService interface {
 // KeybaseServiceCn defines methods needed to construct KeybaseService
 // and Crypto implementations.
 type KeybaseServiceCn interface {
-	NewKeybaseService(config Config, params InitParams, ctx Context, log logger.Logger) (KeybaseService, error)
-	NewCrypto(config Config, params InitParams, ctx Context, log logger.Logger) (Crypto, error)
+	NewKeybaseService(
+		config Config, params InitParams, ctx Context, log logger.Logger) (
+		KeybaseService, error)
+	NewCrypto(
+		config Config, params InitParams, ctx Context, log logger.Logger) (
+		Crypto, error)
+	NewChat(
+		config Config, params InitParams, ctx Context, log logger.Logger) (
+		Chat, error)
 }
 
 type resolver interface {
@@ -629,10 +652,23 @@ type teamMembershipChecker interface {
 	// kbfsmd.TeamMembershipChecker.IsTeamWriter.
 	IsTeamWriter(ctx context.Context, tid keybase1.TeamID, uid keybase1.UID,
 		verifyingKey kbfscrypto.VerifyingKey) (bool, error)
+	// NoLongerTeamWriter returns the global Merkle root of the
+	// most-recent time the given user (with the given device key,
+	// which implies an eldest seqno) transitioned from being a writer
+	// to not being a writer on the given team.  If the user was never
+	// a writer of the team, it returns an error.
+	NoLongerTeamWriter(
+		ctx context.Context, tid keybase1.TeamID, tlfType tlf.Type,
+		uid keybase1.UID, verifyingKey kbfscrypto.VerifyingKey) (
+		keybase1.MerkleRootV2, error)
 	// IsTeamReader is a copy of
 	// kbfsmd.TeamMembershipChecker.IsTeamWriter.
 	IsTeamReader(ctx context.Context, tid keybase1.TeamID, uid keybase1.UID) (
 		bool, error)
+	// ListResolvedTeamMembers returns the lists of resolved writers
+	// and readers.
+	ListResolvedTeamMembers(ctx context.Context, tid keybase1.TeamID) (
+		writers, readers []keybase1.UID, err error)
 }
 
 type teamKeysGetter interface {
@@ -666,19 +702,14 @@ type KBPKI interface {
 	gitMetadataPutter
 
 	// HasVerifyingKey returns nil if the given user has the given
-	// VerifyingKey, and an error otherwise.
+	// VerifyingKey, and an error otherwise.  If the revoked key was
+	// valid according to the untrusted server timestamps, a special
+	// error type `RevokedDeviceVerificationError` is returned, which
+	// includes information the caller can use to verify the key using
+	// the merkle tree.
 	HasVerifyingKey(ctx context.Context, uid keybase1.UID,
 		verifyingKey kbfscrypto.VerifyingKey,
 		atServerTime time.Time) error
-
-	// HasUnverifiedVerifyingKey returns nil if the given user has the given
-	// unverified VerifyingKey, and an error otherwise.  Note that any match
-	// is with a key not verified to be currently connected to the user via
-	// their sigchain.  This is currently only used to verify finalized or
-	// reset TLFs.  Further note that unverified keys is a super set of
-	// verified keys.
-	HasUnverifiedVerifyingKey(ctx context.Context, uid keybase1.UID,
-		verifyingKey kbfscrypto.VerifyingKey) error
 
 	// GetCryptPublicKeys gets all of a user's crypt public keys (including
 	// paper keys).
@@ -708,6 +739,9 @@ type KBPKI interface {
 
 	// Notify sends a filesystem notification.
 	Notify(ctx context.Context, notification *keybase1.FSNotification) error
+
+	// NotifyPathUpdated sends a path updated notification.
+	NotifyPathUpdated(ctx context.Context, path string) error
 }
 
 // KeyMetadata is an interface for something that holds key
@@ -843,8 +877,13 @@ type Reporter interface {
 	AllKnownErrors() []ReportedError
 	// Notify sends the given notification to any sink.
 	Notify(ctx context.Context, notification *keybase1.FSNotification)
+	// NotifyPathUpdated sends the given notification to any sink.
+	NotifyPathUpdated(ctx context.Context, path string)
 	// NotifySyncStatus sends the given path sync status to any sink.
 	NotifySyncStatus(ctx context.Context, status *keybase1.FSPathSyncStatus)
+	// SuppressNotifications suppresses notifications. See
+	// protocol/avdl/keybase1/simple_fs.avdl for more details.
+	SuppressNotifications(ctx context.Context, suppressDuration time.Duration)
 	// Shutdown frees any resources allocated by a Reporter.
 	Shutdown()
 }
@@ -1166,6 +1205,14 @@ type Crypto interface {
 		promptPaper bool) (
 		kbfscrypto.TLFCryptKeyClientHalf, int, error)
 
+	// DecryptTeamMerkleLeaf decrypts a team-encrypted Merkle leaf
+	// using some team key generation greater than `minKeyGen`, and
+	// the provided ephemeral public key.
+	DecryptTeamMerkleLeaf(ctx context.Context, teamID keybase1.TeamID,
+		publicKey kbfscrypto.TLFEphemeralPublicKey,
+		encryptedMerkleLeaf kbfscrypto.EncryptedMerkleLeaf,
+		minKeyGen keybase1.PerTeamKeyGeneration) ([]byte, error)
+
 	// Shutdown frees any resources associated with this instance.
 	Shutdown()
 }
@@ -1177,6 +1224,10 @@ type tlfIDGetter interface {
 	// exist yet, and it may return `tlf.NullID` with a `nil` error if
 	// it doesn't create a missing folder.
 	GetIDForHandle(ctx context.Context, handle *TlfHandle) (tlf.ID, error)
+	// ValidateLatestHandleForTLF returns true if the TLF ID contained
+	// in `h` does not currently map to a finalized TLF.
+	ValidateLatestHandleNotFinal(ctx context.Context, h *TlfHandle) (
+		bool, error)
 }
 
 // MDOps gets and puts root metadata to an MDServer.  On a get, it
@@ -1191,6 +1242,11 @@ type MDOps interface {
 	// If lockBeforeGet is not nil, it causes mdserver to take the lock on the
 	// lock ID before the get.
 	GetForTLF(ctx context.Context, id tlf.ID, lockBeforeGet *keybase1.LockID) (
+		ImmutableRootMetadata, error)
+
+	// GetForTLFByTime returns the newest merged MD update with a
+	// server timestamp less than or equal to `serverTime`.
+	GetForTLFByTime(ctx context.Context, id tlf.ID, serverTime time.Time) (
 		ImmutableRootMetadata, error)
 
 	// GetUnmergedForTLF is the same as the above but for unmerged
@@ -1264,9 +1320,10 @@ type MDOps interface {
 		blocksToDelete []kbfsblock.ID, rmd *RootMetadata,
 		verifyingKey kbfscrypto.VerifyingKey) (ImmutableRootMetadata, error)
 
-	// GetLatestHandleForTLF returns the server's idea of the latest handle for the TLF,
-	// which may not yet be reflected in the MD if the TLF hasn't been rekeyed since it
-	// entered into a conflicting state.
+	// GetLatestHandleForTLF returns the server's idea of the latest
+	// handle for the TLF, which may not yet be reflected in the MD if
+	// the TLF hasn't been rekeyed since it entered into a conflicting
+	// state.
 	GetLatestHandleForTLF(ctx context.Context, id tlf.ID) (tlf.Handle, error)
 }
 
@@ -1405,6 +1462,11 @@ type MDServer interface {
 	GetForTLF(ctx context.Context, id tlf.ID, bid kbfsmd.BranchID, mStatus kbfsmd.MergeStatus,
 		lockBeforeGet *keybase1.LockID) (*RootMetadataSigned, error)
 
+	// GetForTLFByTime returns the earliest merged MD update with a
+	// server timestamp equal or greater to `serverTime`.
+	GetForTLFByTime(ctx context.Context, id tlf.ID, serverTime time.Time) (
+		*RootMetadataSigned, error)
+
 	// GetRange returns a range of (signed/encrypted) metadata objects
 	// corresponding to the passed revision numbers (inclusive).
 	//
@@ -1526,6 +1588,22 @@ type MDServer interface {
 	// reconnects. If MD server is connected at the time this is called, it's
 	// essentially a no-op.
 	FastForwardBackoff()
+
+	// FindNextMD finds the serialized (and possibly encrypted) root
+	// metadata object from the leaf node of the second KBFS merkle
+	// tree to be produced after a given Keybase global merkle tree
+	// sequence number `rootSeqno` (and all merkle nodes between it
+	// and the root, and the root itself).  It also returns the global
+	// merkle tree sequence number of the root that first included the
+	// returned metadata object.
+	FindNextMD(ctx context.Context, tlfID tlf.ID, rootSeqno keybase1.Seqno) (
+		nextKbfsRoot *kbfsmd.MerkleRoot, nextMerkleNodes [][]byte,
+		nextRootSeqno keybase1.Seqno, err error)
+
+	// GetMerkleRootLatest returns the latest KBFS merkle root for the
+	// given tree ID.
+	GetMerkleRootLatest(ctx context.Context, treeID keybase1.MerkleTreeID) (
+		root *kbfsmd.MerkleRoot, err error)
 }
 
 type mdServerLocal interface {
@@ -1537,6 +1615,7 @@ type mdServerLocal interface {
 	isShutdown() bool
 	copy(config mdServerLocalConfig) mdServerLocal
 	enableImplicitTeams()
+	setKbfsMerkleRoot(treeID keybase1.MerkleTreeID, root *kbfsmd.MerkleRoot)
 }
 
 // BlockServer gets and puts opaque data blocks.  The instantiation
@@ -1767,6 +1846,76 @@ type Tracer interface {
 	MaybeFinishTrace(ctx context.Context, err error)
 }
 
+// InitMode encapsulates mode differences.
+type InitMode interface {
+	// Type returns the InitModeType of this mode.
+	Type() InitModeType
+	// IsTestMode returns whether we are running a test.
+	IsTestMode() bool
+	// BlockWorkers returns the number of block workers to run.
+	BlockWorkers() int
+	// PrefetchWorkers returns the number of prefetch workers to run.
+	PrefetchWorkers() int
+	// RekeyWorkers returns the number of rekey workers to run.
+	RekeyWorkers() int
+	// RekeyQueueSize returns the size of the rekey queue.
+	RekeyQueueSize() int
+	// DirtyBlockCacheEnabled indicates if we should run a dirty block
+	// cache.
+	DirtyBlockCacheEnabled() bool
+	// BackgroundFlushesEnabled indicates if we should periodically be
+	// flushing unsynced dirty writes to the server or journal.
+	BackgroundFlushesEnabled() bool
+	// MetricsEnabled indicates if we should be collecting metrics.
+	MetricsEnabled() bool
+	// ConflictResolutionEnabled indicated if we should be running
+	// the conflict resolution background process.
+	ConflictResolutionEnabled() bool
+	// BlockManagementEnabled indicates whether we should be running
+	// the block archive/delete background process, and whether we
+	// should be re-embedding block change blocks in MDs.
+	BlockManagementEnabled() bool
+	// QuotaReclamationEnabled indicates whether we should be running
+	// the quota reclamation background process.
+	QuotaReclamationEnabled() bool
+	// QuotaReclamationPeriod indicates how often should each TLF
+	// should check for quota to reclaim.  If the Duration.Seconds()
+	// == 0, quota reclamation should not run automatically.
+	QuotaReclamationPeriod() time.Duration
+	// QuotaReclamationMinUnrefAge indicates the minimum time a block
+	// must have been unreferenced before it can be reclaimed.
+	QuotaReclamationMinUnrefAge() time.Duration
+	// QuotaReclamationMinHeadAge indicates the minimum age of the
+	// most recently merged MD update before we can run reclamation,
+	// to avoid conflicting with a currently active writer.
+	QuotaReclamationMinHeadAge() time.Duration
+	// NodeCacheEnabled indicates whether we should be caching data nodes.
+	NodeCacheEnabled() bool
+	// TLFUpdatesEnabled indicates whether we should be registering
+	// ourselves with the mdserver for TLF updates.
+	TLFUpdatesEnabled() bool
+	// KBFSServiceEnabled indicates whether we should launch a local
+	// service for answering incoming KBFS-related RPCs.
+	KBFSServiceEnabled() bool
+	// JournalEnabled indicates whether this mode supports a journal.
+	JournalEnabled() bool
+	// UnmergedTLFsEnabled indicates whether it's possible for a
+	// device in this mode to have unmerged TLFs.
+	UnmergedTLFsEnabled() bool
+	// ServiceKeepaliveEnabled indicates whether we need to send
+	// keepalive probes to the Keybase service daemon.
+	ServiceKeepaliveEnabled() bool
+	// TLFEditHistoryEnabled indicates whether we should be running
+	// the background TLF edit history process.
+	TLFEditHistoryEnabled() bool
+	// SendEditNotificationsEnabled indicates whether we should send
+	// edit notifications on FS writes.
+	SendEditNotificationsEnabled() bool
+	// ClientType indicates the type we should advertise to the
+	// Keybase service.
+	ClientType() keybase1.ClientType
+}
+
 type initModeGetter interface {
 	// Mode indicates how KBFS is configured to run.
 	Mode() InitMode
@@ -1787,6 +1936,7 @@ type Config interface {
 	cryptoPureGetter
 	keyGetterGetter
 	cryptoGetter
+	chatGetter
 	signerGetter
 	currentSessionGetterGetter
 	diskBlockCacheGetter
@@ -1814,6 +1964,7 @@ type Config interface {
 	DirtyBlockCache() DirtyBlockCache
 	SetDirtyBlockCache(DirtyBlockCache)
 	SetCrypto(Crypto)
+	SetChat(Chat)
 	SetCodec(kbfscodec.Codec)
 	MDOps() MDOps
 	SetMDOps(MDOps)
@@ -1835,6 +1986,8 @@ type Config interface {
 	SetClock(Clock)
 	ConflictRenamer() ConflictRenamer
 	SetConflictRenamer(ConflictRenamer)
+	UserHistory() *kbfsedits.UserHistory
+	SetUserHistory(*kbfsedits.UserHistory)
 	MetadataVersion() kbfsmd.MetadataVer
 	SetMetadataVersion(kbfsmd.MetadataVer)
 	DefaultBlockType() keybase1.BlockType
@@ -1878,17 +2031,6 @@ type Config interface {
 	// conditions.
 	DelayedCancellationGracePeriod() time.Duration
 	SetDelayedCancellationGracePeriod(time.Duration)
-	// QuotaReclamationPeriod indicates how often should each TLF
-	// should check for quota to reclaim.  If the Duration.Seconds()
-	// == 0, quota reclamation should not run automatically.
-	QuotaReclamationPeriod() time.Duration
-	// QuotaReclamationMinUnrefAge indicates the minimum time a block
-	// must have been unreferenced before it can be reclaimed.
-	QuotaReclamationMinUnrefAge() time.Duration
-	// QuotaReclamationMinHeadAge indicates the minimum age of the
-	// most recently merged MD update before we can run reclamation,
-	// to avoid conflicting with a currently active writer.
-	QuotaReclamationMinHeadAge() time.Duration
 
 	// ResetCaches clears and re-initializes all data and key caches.
 	ResetCaches()
@@ -2101,4 +2243,54 @@ type BlockRetriever interface {
 		prefetchStatus PrefetchStatus) error
 	// TogglePrefetcher creates a new prefetcher.
 	TogglePrefetcher(enable bool, syncCh <-chan struct{}) <-chan struct{}
+}
+
+// ChatChannelNewMessageCB is a callback function that can be called
+// when there's a new message on a given conversation.
+type ChatChannelNewMessageCB func(convID chat1.ConversationID, body string)
+
+// Chat specifies a minimal interface for Keybase chatting.
+type Chat interface {
+	// GetConversationID returns the chat conversation ID associated
+	// with the given TLF name, type, chat type and channel name.
+	GetConversationID(
+		ctx context.Context, tlfName tlf.CanonicalName, tlfType tlf.Type,
+		channelName string, chatType chat1.TopicType) (
+		chat1.ConversationID, error)
+
+	// SendTextMessage (asynchronously) sends a text chat message to
+	// the given conversation and channel.
+	SendTextMessage(
+		ctx context.Context, tlfName tlf.CanonicalName, tlfType tlf.Type,
+		convID chat1.ConversationID, body string) error
+
+	// GetGroupedInbox returns the TLFs with the most-recent chat
+	// messages of the given type, up to `maxChats` of them.
+	GetGroupedInbox(
+		ctx context.Context, chatType chat1.TopicType, maxChats int) (
+		[]*TlfHandle, error)
+
+	// GetChannels returns a list of all the channels for a given
+	// chat. The entries in `convIDs` and `channelNames` have a 1-to-1
+	// correspondence.
+	GetChannels(
+		ctx context.Context, tlfName tlf.CanonicalName, tlfType tlf.Type,
+		chatType chat1.TopicType) (
+		convIDs []chat1.ConversationID, channelNames []string, err error)
+
+	// ReadChannel returns a set of text messages from a channel, and
+	// a `nextPage` pointer to the following set of messages.  If the
+	// given `startPage` is non-nil, it's used to specify the starting
+	// point for the set of messages returned.
+	ReadChannel(
+		ctx context.Context, convID chat1.ConversationID, startPage []byte) (
+		messages []string, nextPage []byte, err error)
+
+	// RegisterForMessages registers a callback that will be called
+	// for each new messages that reaches convID.
+	RegisterForMessages(convID chat1.ConversationID, cb ChatChannelNewMessageCB)
+
+	// ClearCache is called to force this instance to forget
+	// everything it might have cached, e.g. when a user logs out.
+	ClearCache()
 }

@@ -22,6 +22,7 @@ import (
 // Dir.
 type TLF struct {
 	folder *Folder
+	inode  uint64
 
 	dirLock sync.RWMutex
 	dir     *Dir
@@ -32,6 +33,7 @@ func newTLF(fl *FolderList, h *libkbfs.TlfHandle,
 	folder := newFolder(fl, h, name)
 	tlf := &TLF{
 		folder: folder,
+		inode:  fl.fs.assignInode(),
 	}
 	return tlf
 }
@@ -54,7 +56,8 @@ func (tlf *TLF) log() logger.Logger {
 	return tlf.folder.fs.log
 }
 
-func (tlf *TLF) loadDirHelper(ctx context.Context, mode libkbfs.ErrorModeType,
+func (tlf *TLF) loadDirHelper(
+	ctx context.Context, mode libkbfs.ErrorModeType, branch libkbfs.BranchName,
 	filterErr bool) (dir *Dir, exitEarly bool, err error) {
 	dir = tlf.getStoredDir()
 	if dir != nil {
@@ -87,7 +90,7 @@ func (tlf *TLF) loadDirHelper(ctx context.Context, mode libkbfs.ErrorModeType,
 	var rootNode libkbfs.Node
 	if filterErr {
 		rootNode, _, err = tlf.folder.fs.config.KBFSOps().GetRootNode(
-			ctx, handle, libkbfs.MasterBranch)
+			ctx, handle, branch)
 		if err != nil {
 			return nil, false, err
 		}
@@ -97,7 +100,7 @@ func (tlf *TLF) loadDirHelper(ctx context.Context, mode libkbfs.ErrorModeType,
 		}
 	} else {
 		rootNode, _, err = tlf.folder.fs.config.KBFSOps().GetOrCreateRootNode(
-			ctx, handle, libkbfs.MasterBranch)
+			ctx, handle, branch)
 		if err != nil {
 			return nil, false, err
 		}
@@ -109,13 +112,14 @@ func (tlf *TLF) loadDirHelper(ctx context.Context, mode libkbfs.ErrorModeType,
 	}
 
 	tlf.folder.nodes[rootNode.GetID()] = tlf
-	tlf.dir = newDir(tlf.folder, rootNode)
+	tlf.dir = newDirWithInode(tlf.folder, rootNode, tlf.inode)
 
 	return tlf.dir, false, nil
 }
 
 func (tlf *TLF) loadDir(ctx context.Context) (*Dir, error) {
-	dir, _, err := tlf.loadDirHelper(ctx, libkbfs.WriteMode, false)
+	dir, _, err := tlf.loadDirHelper(
+		ctx, libkbfs.WriteMode, libkbfs.MasterBranch, false)
 	return dir, err
 }
 
@@ -125,7 +129,14 @@ func (tlf *TLF) loadDir(ctx context.Context) (*Dir, error) {
 // folder.
 func (tlf *TLF) loadDirAllowNonexistent(ctx context.Context) (
 	*Dir, bool, error) {
-	return tlf.loadDirHelper(ctx, libkbfs.ReadMode, true)
+	return tlf.loadDirHelper(ctx, libkbfs.ReadMode, libkbfs.MasterBranch, true)
+}
+
+func (tlf *TLF) loadArchivedDir(
+	ctx context.Context, branch libkbfs.BranchName) (*Dir, bool, error) {
+	// Always filter errors for archive TLF directories, so that we
+	// don't try to initialize them.
+	return tlf.loadDirHelper(ctx, libkbfs.ReadMode, branch, true)
 }
 
 // Access implements the fs.NodeAccesser interface for *TLF.
@@ -136,6 +147,7 @@ func (tlf *TLF) Access(ctx context.Context, r *fuse.AccessRequest) error {
 // Attr implements the fs.Node interface for TLF.
 func (tlf *TLF) Attr(ctx context.Context, a *fuse.Attr) error {
 	dir := tlf.getStoredDir()
+	a.Inode = tlf.inode
 	if dir == nil {
 		tlf.log().CDebugf(
 			ctx, "Faking Attr for TLF %s", tlf.folder.name())
@@ -188,6 +200,40 @@ func (tlf *TLF) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.
 		}
 		return nil, fuse.ENOENT
 	}
+
+	branch, isArchivedBranch := libfs.BranchNameFromArchiveRefDir(req.Name)
+	if isArchivedBranch {
+		archivedTLF := newTLF(
+			tlf.folder.list, tlf.folder.h, tlf.folder.hPreferredName)
+		_, _, err := archivedTLF.loadArchivedDir(ctx, branch)
+		if err != nil {
+			return nil, err
+		}
+		return archivedTLF, nil
+	}
+
+	linkTarget, isArchivedTimeLink, err := libfs.LinkTargetFromTimeString(
+		ctx, tlf.folder.fs.config, tlf.folder.h, req.Name)
+	if err != nil {
+		return nil, err
+	}
+	if isArchivedTimeLink {
+		return &Alias{
+			realPath: linkTarget,
+			inode:    0,
+		}, nil
+	}
+
+	_, isRelTimeLink, err := libfs.FileDataFromRelativeTimeString(
+		ctx, tlf.folder.fs.config, tlf.folder.h, req.Name)
+	if err != nil {
+		return nil, err
+	}
+	if isRelTimeLink {
+		return NewArchiveRelTimeFile(
+			tlf.folder.fs, tlf.folder.h, req.Name, &resp.EntryValid), nil
+	}
+
 	return dir.Lookup(ctx, req, resp)
 }
 

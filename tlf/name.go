@@ -69,12 +69,11 @@ func getSortedNames(
 	return names
 }
 
-// MakeCanonicalName makes a CanonicalName from components.
-func MakeCanonicalName(resolvedWriters []libkb.NormalizedUsername,
+func makeCanonicalName(resolvedWriters []libkb.NormalizedUsername,
 	unresolvedWriters []keybase1.SocialAssertion,
 	resolvedReaders []libkb.NormalizedUsername,
 	unresolvedReaders []keybase1.SocialAssertion,
-	extensions []HandleExtension) CanonicalName {
+	extensions []HandleExtension, isBackedByTeam bool) CanonicalName {
 	writerNames := getSortedNames(resolvedWriters, unresolvedWriters)
 	canonicalName := strings.Join(writerNames, ",")
 	if len(resolvedReaders)+len(unresolvedReaders) > 0 {
@@ -85,12 +84,51 @@ func MakeCanonicalName(resolvedWriters []libkb.NormalizedUsername,
 	extensionList := make(HandleExtensionList, len(extensions))
 	copy(extensionList, extensions)
 	sort.Sort(extensionList)
-	canonicalName += extensionList.Suffix()
+	if isBackedByTeam {
+		canonicalName += extensionList.SuffixForTeamHandle()
+	} else {
+		canonicalName += extensionList.Suffix()
+	}
 	return CanonicalName(canonicalName)
+}
+
+// MakeCanonicalName makes a CanonicalName from components.
+func MakeCanonicalName(resolvedWriters []libkb.NormalizedUsername,
+	unresolvedWriters []keybase1.SocialAssertion,
+	resolvedReaders []libkb.NormalizedUsername,
+	unresolvedReaders []keybase1.SocialAssertion,
+	extensions []HandleExtension) CanonicalName {
+	return makeCanonicalName(
+		resolvedWriters, unresolvedWriters, resolvedReaders, unresolvedReaders,
+		extensions, false)
+}
+
+// MakeCanonicalNameForTeam makes a CanonicalName from components for a team.
+func MakeCanonicalNameForTeam(resolvedWriters []libkb.NormalizedUsername,
+	unresolvedWriters []keybase1.SocialAssertion,
+	resolvedReaders []libkb.NormalizedUsername,
+	unresolvedReaders []keybase1.SocialAssertion,
+	extensions []HandleExtension) CanonicalName {
+	return makeCanonicalName(
+		resolvedWriters, unresolvedWriters, resolvedReaders, unresolvedReaders,
+		extensions, true)
 }
 
 // PreferredName is a preferred TLF name.
 type PreferredName string
+
+func putUserFirst(uname string, users []string) []string {
+	for i, w := range users {
+		if w == uname {
+			if i != 0 {
+				copy(users[1:i+1], users[0:i])
+				users[0] = w
+				return users
+			}
+		}
+	}
+	return users
+}
 
 // CanonicalToPreferredName returns the preferred TLF name, given a
 // canonical name and a username. The username may be empty, and
@@ -109,21 +147,14 @@ func CanonicalToPreferredName(username libkb.NormalizedUsername,
 		return "", fmt.Errorf("TLF name %q with no writers", tlfname)
 	}
 	uname := username.String()
-	for i, w := range ws {
-		if w == uname {
-			if i != 0 {
-				copy(ws[1:i+1], ws[0:i])
-				ws[0] = w
-				tlfname = strings.Join(ws, ",")
-				if len(rs) > 0 {
-					tlfname += ReaderSep + strings.Join(rs, ",")
-				}
-				if len(ext) > 0 {
-					tlfname += HandleExtensionSep + ext
-				}
-			}
-			break
-		}
+	ws = putUserFirst(uname, ws)
+	rs = putUserFirst(uname, rs)
+	tlfname = strings.Join(ws, ",")
+	if len(rs) > 0 {
+		tlfname += ReaderSep + strings.Join(rs, ",")
+	}
+	if len(ext) > 0 {
+		tlfname += HandleExtensionSep + ext
 	}
 	return PreferredName(tlfname), nil
 }

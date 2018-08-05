@@ -27,13 +27,16 @@ type FolderBranchStatus struct {
 	LatestKeyGeneration kbfsmd.KeyGen
 	FolderID            string
 	Revision            kbfsmd.Revision
+	LastGCRevision      kbfsmd.Revision
 	MDVersion           kbfsmd.MetadataVer
 	RootBlockID         string
 	SyncEnabled         bool
 	PrefetchStatus      string
 	UsageBytes          int64
+	ArchiveBytes        int64
 	LimitBytes          int64
 	GitUsageBytes       int64
+	GitArchiveBytes     int64
 	GitLimitBytes       int64
 
 	// DirtyPaths are files that have been written, but not flushed.
@@ -57,8 +60,10 @@ type KBFSStatus struct {
 	CurrentUser     string
 	IsConnected     bool
 	UsageBytes      int64
+	ArchiveBytes    int64
 	LimitBytes      int64
 	GitUsageBytes   int64
+	GitArchiveBytes int64
 	GitLimitBytes   int64
 	FailingServices map[string]error
 	JournalServer   *JournalServerStatus            `json:",omitempty"`
@@ -207,6 +212,7 @@ func (fbsk *folderBranchStatusKeeper) getStatusWithoutJournaling(
 		fbs.LatestKeyGeneration = fbsk.md.LatestKeyGeneration()
 		fbs.FolderID = fbsk.md.TlfID().String()
 		fbs.Revision = fbsk.md.Revision()
+		fbs.LastGCRevision = fbsk.md.data.LastGCRevision
 		fbs.MDVersion = fbsk.md.Version()
 		fbs.SyncEnabled = fbsk.config.IsSyncedTlf(fbsk.md.TlfID())
 		prefetchStatus := fbsk.config.PrefetchStatus(ctx, fbsk.md.TlfID(),
@@ -232,7 +238,8 @@ func (fbsk *folderBranchStatusKeeper) getStatusWithoutJournaling(
 					fbsk.config, loggerSuffix)
 			}
 		}
-		_, usageBytes, limitBytes, gitUsageBytes, gitLimitBytes, quErr :=
+		_, usageBytes, archiveBytes, limitBytes,
+			gitUsageBytes, gitArchiveBytes, gitLimitBytes, quErr :=
 			fbsk.quotaUsage.GetAllTypes(ctx, 0, 0)
 		if quErr != nil {
 			// The error is ignored here so that other fields can
@@ -241,8 +248,10 @@ func (fbsk *folderBranchStatusKeeper) getStatusWithoutJournaling(
 			log.CDebugf(ctx, "Getting quota usage error: %v", quErr)
 		}
 		fbs.UsageBytes = usageBytes
+		fbs.ArchiveBytes = archiveBytes
 		fbs.LimitBytes = limitBytes
 		fbs.GitUsageBytes = gitUsageBytes
+		fbs.GitArchiveBytes = gitArchiveBytes
 		fbs.GitLimitBytes = gitLimitBytes
 	}
 

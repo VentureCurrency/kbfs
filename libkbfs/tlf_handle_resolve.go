@@ -7,7 +7,6 @@ package libkbfs
 // This file has the online resolving functionality for TlfHandles.
 
 import (
-	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -20,6 +19,7 @@ import (
 	"github.com/keybase/kbfs/kbfscodec"
 	"github.com/keybase/kbfs/kbfsmd"
 	"github.com/keybase/kbfs/tlf"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -183,10 +183,6 @@ func makeTlfHandleHelper(
 		unresolvedReaders = getSortedUnresolved(usedUnresolvedReaders)
 	}
 
-	canonicalName := tlf.MakeCanonicalName(
-		getNames(usedWNames), unresolvedWriters,
-		getNames(usedRNames), unresolvedReaders, extensions)
-
 	extensionList := tlf.HandleExtensionList(extensions)
 	sort.Sort(extensionList)
 	conflictInfo, finalizedInfo := extensionList.Splat()
@@ -198,6 +194,17 @@ func makeTlfHandleHelper(
 		for id := range usedWNames {
 			isImplicit = id.IsTeam()
 		}
+	}
+
+	var canonicalName tlf.CanonicalName
+	if isImplicit || t == tlf.SingleTeam {
+		canonicalName = tlf.MakeCanonicalNameForTeam(
+			getNames(usedWNames), unresolvedWriters,
+			getNames(usedRNames), unresolvedReaders, extensions)
+	} else {
+		canonicalName = tlf.MakeCanonicalName(
+			getNames(usedWNames), unresolvedWriters,
+			getNames(usedRNames), unresolvedReaders, extensions)
 	}
 
 	switch t {
@@ -270,7 +277,7 @@ type resolvableID struct {
 
 func (ruid resolvableID) resolve(ctx context.Context) (
 	nameIDPair, keybase1.SocialAssertion, tlf.ID, error) {
-	if doResolveImplicit(ctx) && ruid.id.IsTeamOrSubteam() {
+	if doResolveImplicit(ctx, ruid.tlfType) && ruid.id.IsTeamOrSubteam() {
 		// First check if this is an implicit team.
 		iteamInfo, err := ruid.resolver.ResolveImplicitTeamByID(
 			ctx, ruid.id.AsTeamOrBust(), ruid.tlfType)
@@ -443,7 +450,7 @@ func (pr partialResolver) Resolve(ctx context.Context, assertion string) (
 // equal other if and only if true is returned.
 func (h TlfHandle) ResolvesTo(
 	ctx context.Context, codec kbfscodec.Codec, resolver resolver,
-	idGetter tlfIDGetter, other TlfHandle) (
+	idGetter tlfIDGetter, teamChecker teamMembershipChecker, other TlfHandle) (
 	resolvesTo bool, partialResolvedH *TlfHandle,
 	err error) {
 	// Check the conflict extension.
@@ -487,6 +494,53 @@ func (h TlfHandle) ResolvesTo(
 		if err != nil {
 			return false, nil, err
 		}
+
+		// If we're migrating, make sure the handles map to the same
+		// set of users.
+		if other.TypeForKeying() == tlf.TeamKeying && teamChecker != nil {
+			if h.IsFinal() {
+				return false, nil,
+					errors.New("Can't migrate a finalized folder")
+			}
+
+			teamID := other.FirstResolvedWriter().AsTeamOrBust()
+			writers, readers, err := teamChecker.ListResolvedTeamMembers(
+				ctx, teamID)
+			if err != nil {
+				return false, nil, err
+			}
+
+			bareHandle, err := partialResolvedH.ToBareHandle()
+			if err != nil {
+				return false, nil, err
+			}
+
+			wUsers := make([]keybase1.UserOrTeamID, len(writers))
+			for i, w := range writers {
+				wUsers[i] = w.AsUserOrTeam()
+			}
+			var rUsers []keybase1.UserOrTeamID
+			if h.Type() == tlf.Public {
+				rUsers = append(rUsers, keybase1.PUBLIC_UID)
+			} else {
+				rUsers = make([]keybase1.UserOrTeamID, len(readers))
+				for i, r := range readers {
+					rUsers[i] = r.AsUserOrTeam()
+				}
+			}
+			if !bareHandle.ResolvedUsersEqual(wUsers, rUsers) {
+				return false, nil, err
+			}
+			// Set other's writers/readers to be equal to h's, since
+			// we already checked the team membership.  If the
+			// unresolved writers/readers differ, it'll cause the name
+			// to be different.
+			other.resolvedWriters = partialResolvedH.resolvedWriters
+			other.resolvedReaders = partialResolvedH.resolvedReaders
+			other.unresolvedWriters = partialResolvedH.unresolvedWriters
+			other.unresolvedReaders = partialResolvedH.unresolvedReaders
+			other.conflictInfo = partialResolvedH.conflictInfo
+		}
 	}
 
 	if conflictAdded || finalizedAdded {
@@ -508,14 +562,14 @@ func (h TlfHandle) MutuallyResolvesTo(
 	resolver resolver, idGetter tlfIDGetter, other TlfHandle,
 	rev kbfsmd.Revision, tlfID tlf.ID, log logger.Logger) error {
 	handleResolvesToOther, partialResolvedHandle, err :=
-		h.ResolvesTo(ctx, codec, resolver, idGetter, other)
+		h.ResolvesTo(ctx, codec, resolver, idGetter, nil, other)
 	if err != nil {
 		return err
 	}
 
 	// TODO: If h has conflict info, other should, too.
 	otherResolvesToHandle, partialResolvedOther, err :=
-		other.ResolvesTo(ctx, codec, resolver, idGetter, h)
+		other.ResolvesTo(ctx, codec, resolver, idGetter, nil, h)
 	if err != nil {
 		return err
 	}
@@ -668,7 +722,11 @@ func (rit resolvableImplicitTeam) resolve(ctx context.Context) (
 	}, keybase1.SocialAssertion{}, iteamInfo.TlfID, nil
 }
 
-func doResolveImplicit(ctx context.Context) bool {
+func doResolveImplicit(ctx context.Context, t tlf.Type) bool {
+	if t == tlf.SingleTeam {
+		return false
+	}
+
 	// Chat calls will never need us to resolve implicit teams for
 	// them.
 	switch getExtendedIdentify(ctx).behavior {
@@ -693,16 +751,48 @@ func parseTlfHandleLoose(
 		return nil, err
 	}
 
+	var extensions []tlf.HandleExtension
+	if len(extensionSuffix) != 0 {
+		extensions, err = tlf.ParseHandleExtensionSuffix(extensionSuffix)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// First try resolving this full name as an implicit team.  If
 	// that doesn't work, fall through to individual name resolution.
 	var iteamHandle *TlfHandle
-	if doResolveImplicit(ctx) {
+	if doResolveImplicit(ctx, t) {
 		rit := resolvableImplicitTeam{kbpki, name, t}
 		iteamHandle, err = makeTlfHandleHelper(
 			ctx, t, []resolvableUser{rit}, nil, nil, idGetter)
 		if err == nil && iteamHandle.tlfID != tlf.NullID {
 			// The iteam already has a TLF ID, let's use it.
-			return iteamHandle, nil
+
+			extensionList := tlf.HandleExtensionList(extensions)
+			sort.Sort(extensionList)
+			_, finalizedInfo := extensionList.Splat()
+
+			if finalizedInfo == nil && idGetter != nil {
+				// Implicit team chat migration might have set the ID to an
+				// old folder that has since been reset.  Check with the
+				// server to see if that has happened, and if so, don't use
+				// that ID.  When we migrate existing TLFs to iteams, we can
+				// probably override the sigchain link with a new one
+				// containing the correct TLF ID.
+				valid, err := idGetter.ValidateLatestHandleNotFinal(
+					ctx, iteamHandle)
+				if err != nil {
+					return nil, err
+				}
+				if !valid {
+					iteamHandle.tlfID = tlf.NullID
+				}
+			}
+
+			if iteamHandle.tlfID != tlf.NullID {
+				return iteamHandle, nil
+			}
 		}
 		// This is not an implicit team, so continue on to check for a
 		// normal team.  TODO: return non-nil errors immediately if they
@@ -735,14 +825,6 @@ func parseTlfHandleLoose(
 			resolvableAssertion{kbpki, kbpki, r, keybase1.UID("")}, changesCh}
 	}
 
-	var extensions []tlf.HandleExtension
-	if len(extensionSuffix) != 0 {
-		extensions, err = tlf.ParseHandleExtensionSuffix(extensionSuffix)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	h, err := makeTlfHandleHelper(
 		ctx, t, writers, readers, extensions, idGetter)
 	if err != nil {
@@ -769,12 +851,33 @@ func parseTlfHandleLoose(
 		}
 	}
 
+	canonicalName := string(h.GetCanonicalName())
 	if extensionSuffix != "" {
 		extensionList := tlf.HandleExtensionList(extensions)
 		sort.Sort(extensionList)
-		var canonExtensionString = extensionList.Suffix()
+		var canonExtensionString string
+		// If this resolve is being done in a "quick" way that doesn't
+		// check for implicit teams, we might not know if this handle
+		// is backed by a team or not.  But (mostly for tests) we need
+		// to make sure the suffix reflects the right format,
+		// otherwise we'll get too many levels of non-canonical
+		// redirects.  So if the user explicitly specified a "#1" in
+		// their suffix, let's keep it there and assume the user knows
+		// what they're doing.
+		if h.IsBackedByTeam() || strings.Contains(extensionSuffix, "#1") {
+			canonExtensionString = extensionList.SuffixForTeamHandle()
+		} else {
+			canonExtensionString = extensionList.Suffix()
+		}
+		_, _, currExtensionSuffix, _ :=
+			splitAndNormalizeTLFName(canonicalName, t)
+		canonicalName = strings.Replace(
+			canonicalName, tlf.HandleExtensionSep+currExtensionSuffix,
+			canonExtensionString, 1)
+		h.name = tlf.CanonicalName(canonicalName)
 		if canonExtensionString != tlf.HandleExtensionSep+extensionSuffix {
-			return nil, TlfNameNotCanonical{name, string(h.GetCanonicalName())}
+			return nil, errors.WithStack(
+				TlfNameNotCanonical{name, canonicalName})
 		}
 	}
 
@@ -794,7 +897,7 @@ func parseTlfHandleLoose(
 	// In this case return both the handle and the error,
 	// ParseTlfHandlePreferred uses this to make the redirection
 	// better.
-	return h, TlfNameNotCanonical{name, string(h.GetCanonicalName())}
+	return h, errors.WithStack(TlfNameNotCanonical{name, canonicalName})
 }
 
 // ParseTlfHandle parses a TlfHandle from an encoded string. See
@@ -820,7 +923,7 @@ func ParseTlfHandle(
 		return nil, err
 	}
 	if name != string(h.GetCanonicalName()) {
-		return nil, TlfNameNotCanonical{name, string(h.GetCanonicalName())}
+		return nil, errors.WithStack(TlfNameNotCanonical{name, string(h.GetCanonicalName())})
 	}
 	return h, nil
 }
@@ -854,12 +957,12 @@ func ParseTlfHandlePreferred(
 	}
 	pref := h.GetPreferredFormat(session.Name)
 	if string(pref) != name {
-		return nil, TlfNameNotCanonical{name, string(pref)}
+		return nil, errors.WithStack(TlfNameNotCanonical{name, string(pref)})
 	}
 	return h, nil
 }
 
 func isTlfNameNotCanonical(err error) bool {
-	_, ok := err.(TlfNameNotCanonical)
+	_, ok := errors.Cause(err).(TlfNameNotCanonical)
 	return ok
 }

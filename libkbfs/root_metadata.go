@@ -276,13 +276,36 @@ func (md *RootMetadata) MakeSuccessor(
 	}
 	newMd.SetRevision(md.Revision() + 1)
 
-	merkleRoot, err := merkleGetter.GetCurrentMerkleRoot(ctx)
+	merkleRoot, _, err := merkleGetter.GetCurrentMerkleRoot(ctx)
 	if err != nil {
 		return nil, err
 	}
 	newMd.SetMerkleRoot(merkleRoot)
 
 	return newMd, nil
+}
+
+// MakeSuccessorWithNewHandle does the same thing as MakeSuccessor,
+// plus it changes the handle.  (The caller is responsible for
+// ensuring that the handle change is valid.)
+func (md *RootMetadata) MakeSuccessorWithNewHandle(
+	ctx context.Context, newHandle *TlfHandle, latestMDVer kbfsmd.MetadataVer,
+	codec kbfscodec.Codec, keyManager KeyManager, merkleGetter merkleRootGetter,
+	teamKeyer teamKeysGetter, mdID kbfsmd.ID, isWriter bool) (
+	*RootMetadata, error) {
+	mdCopy, err := md.deepCopy(codec)
+	if err != nil {
+		return nil, err
+	}
+
+	mdCopy.extra = nil
+	mdCopy.tlfHandle = newHandle.deepCopy()
+	mdCopy.SetWriters(newHandle.ResolvedWriters())
+	mdCopy.bareMd.ClearForV4Migration()
+
+	return mdCopy.MakeSuccessor(
+		ctx, latestMDVer, codec, keyManager, merkleGetter, teamKeyer, mdID,
+		isWriter)
 }
 
 // GetTlfHandle returns the TlfHandle for this RootMetadata.
@@ -883,18 +906,7 @@ func (md *RootMetadata) IsReader(
 	ctx context.Context, checker kbfsmd.TeamMembershipChecker,
 	uid keybase1.UID) (bool, error) {
 	h := md.GetTlfHandle()
-	if md.TypeForKeying() != tlf.TeamKeying {
-		return h.IsReader(uid), nil
-	}
-
-	// Team membership needs to be checked with the service.  For a
-	// SingleTeam TLF, there is always only a single writer in the
-	// handle.
-	tid, err := h.FirstResolvedWriter().AsTeam()
-	if err != nil {
-		return false, err
-	}
-	return checker.IsTeamReader(ctx, tid, uid)
+	return isReaderFromHandle(ctx, h, checker, uid)
 }
 
 // A ReadOnlyRootMetadata is a thin wrapper around a

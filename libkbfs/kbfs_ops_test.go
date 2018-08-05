@@ -63,7 +63,7 @@ func kbfsOpsInit(t *testing.T) (mockCtrl *gomock.Controller,
 	config.SetCodec(kbfscodec.NewMsgpack())
 	blockops := &CheckBlockOps{config.mockBops, ctr}
 	config.SetBlockOps(blockops)
-	kbfsops := NewKBFSOpsStandard(config)
+	kbfsops := NewKBFSOpsStandard(libkb.NewGlobalContext().Init(), config)
 	config.SetKBFSOps(kbfsops)
 	config.SetNotifier(kbfsops)
 
@@ -83,6 +83,10 @@ func kbfsOpsInit(t *testing.T) (mockCtrl *gomock.Controller,
 		gomock.Any(), gomock.Any()).AnyTimes().Return(c, nil)
 	config.mockMdserv.EXPECT().OffsetFromServerTime().
 		Return(time.Duration(0), true).AnyTimes()
+	// No chat monitoring.
+	config.mockChat.EXPECT().GetChannels(gomock.Any(),
+		gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().
+		Return(nil, nil, nil)
 
 	// Don't test implicit teams.
 	config.mockKbpki.EXPECT().ResolveImplicitTeam(
@@ -97,7 +101,7 @@ func kbfsOpsInit(t *testing.T) (mockCtrl *gomock.Controller,
 
 	// Ignore MerkleRoot calls for now.
 	config.mockKbpki.EXPECT().GetCurrentMerkleRoot(gomock.Any()).
-		Return(keybase1.MerkleRootV2{}, nil).AnyTimes()
+		Return(keybase1.MerkleRootV2{}, time.Time{}, nil).AnyTimes()
 
 	// Max out MaxPtrsPerBlock
 	config.mockBsplit.EXPECT().MaxPtrsPerBlock().
@@ -167,11 +171,26 @@ func kbfsTestShutdown(mockCtrl *gomock.Controller, config *ConfigMock,
 	mockCtrl.Finish()
 }
 
+type modeNoHistory struct {
+	InitMode
+}
+
+func (mnh modeNoHistory) TLFEditHistoryEnabled() bool {
+	return false
+}
+
+func (mnh modeNoHistory) SendEditNotificationsEnabled() bool {
+	return false
+}
+
 // kbfsOpsInitNoMocks returns a config that doesn't use any mocks. The
 // shutdown call is kbfsTestShutdownNoMocks.
 func kbfsOpsInitNoMocks(t *testing.T, users ...libkb.NormalizedUsername) (
 	*ConfigLocal, keybase1.UID, context.Context, context.CancelFunc) {
 	config := MakeTestConfigOrBust(t, users...)
+	// Turn off tlf edit history because it messes with the FBO state
+	// asynchronously.
+	config.mode = modeNoHistory{config.Mode()}
 	config.SetRekeyWithPromptWaitTime(individualTestTimeout)
 
 	timeoutCtx, cancel := context.WithTimeout(
@@ -591,12 +610,6 @@ func TestKBFSOpsGetRootMDForHandleExisting(t *testing.T) {
 		},
 	}
 
-	config.mockMdops.EXPECT().GetUnmergedForTLF(
-		gomock.Any(), id, kbfsmd.NullBranchID).Return(
-		ImmutableRootMetadata{}, nil)
-	config.mockMdops.EXPECT().GetForTLF(
-		gomock.Any(), id, nil).Return(
-		makeImmutableRMDForTest(t, config, rmd, kbfsmd.FakeID(1)), nil)
 	ops := getOps(config, id)
 	assert.False(t, fboIdentityDone(ops))
 
@@ -727,7 +740,7 @@ func TestKBFSOpsGetBaseDirChildrenHidesFiles(t *testing.T) {
 	for c, ei := range children {
 		if de, ok := dirBlock.Children[c]; !ok {
 			t.Errorf("No such child: %s", c)
-		} else if de.EntryInfo != ei {
+		} else if !de.EntryInfo.Eq(ei) {
 			t.Errorf("Wrong EntryInfo for child %s: %v", c, ei)
 		}
 	}
@@ -760,7 +773,7 @@ func TestKBFSOpsGetBaseDirChildrenCacheSuccess(t *testing.T) {
 	for c, ei := range children {
 		if de, ok := dirBlock.Children[c]; !ok {
 			t.Errorf("No such child: %s", c)
-		} else if de.EntryInfo != ei {
+		} else if !de.EntryInfo.Eq(ei) {
 			t.Errorf("Wrong EntryInfo for child %s: %v", c, ei)
 		}
 	}
@@ -893,7 +906,7 @@ func TestKBFSOpsGetNestedDirChildrenCacheSuccess(t *testing.T) {
 	for c, ei := range children {
 		if de, ok := dirBlock.Children[c]; !ok {
 			t.Errorf("No such child: %s", c)
-		} else if de.EntryInfo != ei {
+		} else if !de.EntryInfo.Eq(ei) {
 			t.Errorf("Wrong EntryInfo for child %s: %v", c, ei)
 		}
 	}
@@ -935,7 +948,7 @@ func TestKBFSOpsLookupSuccess(t *testing.T) {
 	bPath := ops.nodeCache.PathFromNode(bn)
 	expectedBNode := pathNode{makeBP(bID, rmd, config, u), "b"}
 	expectedBNode.KeyGen = kbfsmd.FirstValidKeyGen
-	if ei != dirBlock.Children["b"].EntryInfo {
+	if !ei.Eq(dirBlock.Children["b"].EntryInfo) {
 		t.Errorf("Lookup returned a bad entry info: %v vs %v",
 			ei, dirBlock.Children["b"].EntryInfo)
 	} else if bPath.path[2] != expectedBNode {
@@ -976,7 +989,7 @@ func TestKBFSOpsLookupSymlinkSuccess(t *testing.T) {
 	if err != nil {
 		t.Errorf("Error on Lookup: %+v", err)
 	}
-	if ei != dirBlock.Children["b"].EntryInfo {
+	if !ei.Eq(dirBlock.Children["b"].EntryInfo) {
 		t.Errorf("Lookup returned a bad directory entry: %v vs %v",
 			ei, dirBlock.Children["b"].EntryInfo)
 	} else if bn != nil {
@@ -1103,7 +1116,7 @@ func TestKBFSOpsStatSuccess(t *testing.T) {
 	if err != nil {
 		t.Errorf("Error on Stat: %+v", err)
 	}
-	if ei != dirBlock.Children["b"].EntryInfo {
+	if !ei.Eq(dirBlock.Children["b"].EntryInfo) {
 		t.Errorf("Stat returned a bad entry info: %v vs %v",
 			ei, dirBlock.Children["b"].EntryInfo)
 	}
@@ -1606,36 +1619,6 @@ func TestRenameFailAcrossTopLevelFolders(t *testing.T) {
 
 	expectedErr := RenameAcrossDirsError{}
 
-	if err := config.KBFSOps().Rename(ctx, n1, "b", n2, "c"); err == nil {
-		t.Errorf("Got no expected error on rename")
-	} else if err.Error() != expectedErr.Error() {
-		t.Errorf("Got unexpected error on rename: %+v", err)
-	}
-}
-
-func TestRenameFailAcrossBranches(t *testing.T) {
-	mockCtrl, config, ctx, cancel := kbfsOpsInit(t)
-	defer kbfsTestShutdown(mockCtrl, config, ctx, cancel)
-
-	id1 := tlf.FakeID(1, tlf.Private)
-	h1 := parseTlfHandleOrBust(t, config, "alice,bob", tlf.Private, id1)
-	rmd1, err := makeInitialRootMetadata(config.MetadataVersion(), id1, h1)
-	require.NoError(t, err)
-
-	uid1 := h1.FirstResolvedWriter()
-	rootID1 := kbfsblock.FakeID(41)
-	aID1 := kbfsblock.FakeID(42)
-	node1 := pathNode{makeBP(rootID1, rmd1, config, uid1), "p"}
-	aNode1 := pathNode{makeBP(aID1, rmd1, config, uid1), "a"}
-	p1 := path{FolderBranch{Tlf: id1}, []pathNode{node1, aNode1}}
-	p2 := path{FolderBranch{id1, "test"}, []pathNode{node1, aNode1}}
-	ops1 := getOps(config, id1)
-	n1 := nodeFromPath(t, ops1, p1)
-	ops2 := config.KBFSOps().(*KBFSOpsStandard).getOpsNoAdd(
-		ctx, FolderBranch{id1, "test"})
-	n2 := nodeFromPath(t, ops2, p2)
-
-	expectedErr := RenameAcrossDirsError{}
 	if err := config.KBFSOps().Rename(ctx, n1, "b", n2, "c"); err == nil {
 		t.Errorf("Got no expected error on rename")
 	} else if err.Error() != expectedErr.Error() {
@@ -3332,6 +3315,9 @@ func TestKBFSOpsMaliciousMDServerRange(t *testing.T) {
 	config1, _, ctx, cancel := kbfsOpsInitNoMocks(t, "alice", "mallory")
 	// TODO: Use kbfsTestShutdownNoMocks.
 	defer kbfsTestShutdownNoMocksNoCheck(t, config1, ctx, cancel)
+	// Turn off tlf edit history because it messes with the FBO state
+	// asynchronously.
+	config1.mode = modeNoHistory{config1.Mode()}
 
 	// Create alice's TLF.
 	rootNode1 := GetRootNodeOrBust(ctx, t, config1, "alice", tlf.Private)
@@ -3346,6 +3332,7 @@ func TestKBFSOpsMaliciousMDServerRange(t *testing.T) {
 
 	// Create mallory's fake TLF using the same TLF ID as alice's.
 	config2 := ConfigAsUser(config1, "mallory")
+	config2.mode = modeNoHistory{config2.Mode()}
 	crypto2 := cryptoFixedTlf{config2.Crypto(), fb1.Tlf}
 	config2.SetCrypto(crypto2)
 	mdserver2, err := NewMDServerMemory(mdServerLocalConfigAdapter{config2})
@@ -3692,4 +3679,144 @@ func TestKBFSOpsAutocreateNodesDir(t *testing.T) {
 
 func TestKBFSOpsAutocreateNodesSym(t *testing.T) {
 	testKBFSOpsAutocreateNodes(t, Sym, "sympath")
+}
+
+func testKBFSOpsMigrateToImplicitTeam(
+	t *testing.T, ty tlf.Type, initialMDVer kbfsmd.MetadataVer) {
+	var u1, u2 libkb.NormalizedUsername = "u1", "u2"
+	config1, _, ctx, cancel := kbfsOpsConcurInit(t, u1, u2)
+	defer kbfsConcurTestShutdown(t, config1, ctx, cancel)
+	config1.SetMetadataVersion(initialMDVer)
+
+	config2 := ConfigAsUser(config1, u2)
+	defer CheckConfigAndShutdown(ctx, t, config2)
+	config2.SetMetadataVersion(initialMDVer)
+
+	t.Log("Create the folder before implicit teams are enabled.")
+	name := "u1,u2"
+	h, err := ParseTlfHandle(
+		ctx, config1.KBPKI(), config1.MDOps(), string(name), ty)
+	require.NoError(t, err)
+	require.False(t, h.IsBackedByTeam())
+	kbfsOps1 := config1.KBFSOps()
+	rootNode1, _, err := kbfsOps1.GetOrCreateRootNode(
+		ctx, h, MasterBranch)
+	require.NoError(t, err)
+	_, _, err = kbfsOps1.CreateDir(ctx, rootNode1, "a")
+	require.NoError(t, err)
+	err = kbfsOps1.SyncAll(ctx, rootNode1.GetFolderBranch())
+	require.NoError(t, err)
+
+	t.Log("Load the folder for u2.")
+	kbfsOps2 := config2.KBFSOps()
+	rootNode2, _, err := kbfsOps2.GetOrCreateRootNode(
+		ctx, h, MasterBranch)
+	require.NoError(t, err)
+	eis, err := kbfsOps2.GetDirChildren(ctx, rootNode2)
+	require.NoError(t, err)
+	require.Len(t, eis, 1)
+	_, ok := eis["a"]
+	require.True(t, ok)
+
+	// These are deterministic, and should add the same
+	// ImplicitTeamInfos for both user configs.
+	err = EnableImplicitTeamsForTest(config1)
+	require.NoError(t, err)
+	teamID := AddImplicitTeamForTestOrBust(t, config1, name, "", 1, ty)
+	_ = AddImplicitTeamForTestOrBust(t, config2, name, "", 1, ty)
+	// The service should be adding the team TLF ID to the iteam's
+	// sigchain before they call `StartMigration`.
+	err = config1.KBPKI().CreateTeamTLF(ctx, teamID, h.tlfID)
+	require.NoError(t, err)
+	err = config2.KBPKI().CreateTeamTLF(ctx, teamID, h.tlfID)
+	require.NoError(t, err)
+	config1.SetMetadataVersion(kbfsmd.ImplicitTeamsVer)
+	config2.SetMetadataVersion(kbfsmd.ImplicitTeamsVer)
+
+	t.Log("Starting migration to implicit team")
+	err = kbfsOps1.MigrateToImplicitTeam(ctx, h.tlfID)
+	require.NoError(t, err)
+	_, _, err = kbfsOps1.CreateDir(ctx, rootNode1, "b")
+	require.NoError(t, err)
+	err = kbfsOps1.SyncAll(ctx, rootNode1.GetFolderBranch())
+	require.NoError(t, err)
+
+	t.Log("Check migration from other client")
+	err = kbfsOps2.SyncFromServer(ctx, rootNode2.GetFolderBranch(), nil)
+	require.NoError(t, err)
+	eis, err = kbfsOps2.GetDirChildren(ctx, rootNode2)
+	require.NoError(t, err)
+	require.Len(t, eis, 2)
+	_, ok = eis["a"]
+	require.True(t, ok)
+	_, ok = eis["b"]
+	require.True(t, ok)
+
+	t.Log("Make sure the new MD really is keyed for the implicit team")
+	ops1 := getOps(config1, rootNode1.GetFolderBranch().Tlf)
+	lState := makeFBOLockState()
+	md, err := ops1.getMDForRead(ctx, lState, mdReadNeedIdentify)
+	require.NoError(t, err)
+	require.Equal(t, tlf.TeamKeying, md.TypeForKeying())
+	require.Equal(t, kbfsmd.ImplicitTeamsVer, md.Version())
+}
+
+func TestKBFSOpsMigratePrivateToImplicitTeam(t *testing.T) {
+	testKBFSOpsMigrateToImplicitTeam(
+		t, tlf.Private, kbfsmd.SegregatedKeyBundlesVer)
+}
+
+func TestKBFSOpsMigratePublicToImplicitTeam(t *testing.T) {
+	testKBFSOpsMigrateToImplicitTeam(
+		t, tlf.Public, kbfsmd.SegregatedKeyBundlesVer)
+}
+
+func TestKBFSOpsMigratePrivateV2ToImplicitTeam(t *testing.T) {
+	testKBFSOpsMigrateToImplicitTeam(
+		t, tlf.Private, kbfsmd.InitialExtraMetadataVer)
+}
+
+func TestKBFSOpsMigratePublicV2ToImplicitTeam(t *testing.T) {
+	testKBFSOpsMigrateToImplicitTeam(
+		t, tlf.Public, kbfsmd.InitialExtraMetadataVer)
+}
+
+func TestKBFSOpsArchiveBranchType(t *testing.T) {
+	var u1 libkb.NormalizedUsername = "u1"
+	config, _, ctx, cancel := kbfsOpsConcurInit(t, u1)
+	defer kbfsConcurTestShutdown(t, config, ctx, cancel)
+
+	t.Log("Create a private folder for the master branch.")
+	name := "u1"
+	h, err := ParseTlfHandle(
+		ctx, config.KBPKI(), config.MDOps(), string(name), tlf.Private)
+	require.NoError(t, err)
+	kbfsOps := config.KBFSOps()
+	rootNode, _, err := kbfsOps.GetOrCreateRootNode(ctx, h, MasterBranch)
+	require.NoError(t, err)
+	require.False(t, rootNode.Readonly(ctx))
+	fb := rootNode.GetFolderBranch()
+
+	t.Log("Make a new revision")
+	_, _, err = kbfsOps.CreateDir(ctx, rootNode, "a")
+	require.NoError(t, err)
+	err = kbfsOps.SyncAll(ctx, rootNode.GetFolderBranch())
+	require.NoError(t, err)
+
+	t.Log("Create an archived version for the same TLF.")
+	rootNodeArchived, _, err := kbfsOps.GetRootNode(
+		ctx, h, MakeRevBranchName(1))
+	require.NoError(t, err)
+
+	eis, err := kbfsOps.GetDirChildren(ctx, rootNodeArchived)
+	require.NoError(t, err)
+	require.Len(t, eis, 0)
+
+	eis, err = kbfsOps.GetDirChildren(ctx, rootNode)
+	require.NoError(t, err)
+	require.Len(t, eis, 1)
+
+	archiveFB := FolderBranch{fb.Tlf, MakeRevBranchName(1)}
+	require.Equal(t, archiveFB, rootNodeArchived.GetFolderBranch())
+	require.True(t, rootNodeArchived.Readonly(ctx))
 }

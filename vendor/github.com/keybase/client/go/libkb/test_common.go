@@ -166,21 +166,22 @@ func (tc *TestContext) MakePGPKey(id string) (*PGPKeyBundle, error) {
 	return GeneratePGPKeyBundle(tc.G, arg, tc.G.UI.GetLogUI())
 }
 
-// ResetLoginStateForTest simulates a shutdown and restart (for client
+// SimulatServiceRestart simulates a shutdown and restart (for client
 // state). Used by tests that need to clear out cached login state
 // without logging out.
-func (tc *TestContext) ResetLoginState() {
-	tc.G.createLoginState()
+func (tc *TestContext) SimulateServiceRestart() {
+	tc.G.simulateServiceRestart()
 }
 
 func (tc TestContext) ClearAllStoredSecrets() error {
-	usernames, err := tc.G.GetUsersWithStoredSecrets()
+	m := NewMetaContextForTest(tc)
+	usernames, err := tc.G.GetUsersWithStoredSecrets(m.Ctx())
 	if err != nil {
 		return err
 	}
 	for _, username := range usernames {
 		nu := NewNormalizedUsername(username)
-		err = ClearStoredSecret(tc.G, nu)
+		err = ClearStoredSecret(m, nu)
 		if err != nil {
 			return err
 		}
@@ -233,7 +234,10 @@ func setupTestContext(tb TestingTB, name string, tcPrev *TestContext) (tc TestCo
 	g.Env.Test = tc.Tp
 
 	// SecretStoreFile needs test home directory
-	g.SecretStoreAll = NewSecretStoreLocked(g)
+	g.secretStoreMu.Lock()
+	m := NewMetaContextTODO(g)
+	g.secretStore = NewSecretStoreLocked(m)
+	g.secretStoreMu.Unlock()
 
 	g.ConfigureLogging()
 
@@ -268,10 +272,6 @@ func setupTestContext(tb TestingTB, name string, tcPrev *TestContext) (tc TestCo
 	g.SetUIDMapper(NewTestUIDMapper(g.GetUPAKLoader()))
 	tc.G = g
 	tc.T = tb
-
-	if g.SecretStoreAll == nil {
-		g.SecretStoreAll = &SecretStoreLocked{SecretStoreAll: NewTestSecretStoreAll(g, g)}
-	}
 
 	return
 }
@@ -332,6 +332,10 @@ func (n *nullui) Printf(f string, args ...interface{}) (int, error) {
 
 func (n *nullui) PrintfStderr(f string, args ...interface{}) (int, error) {
 	return fmt.Fprintf(os.Stderr, f, args...)
+}
+
+func (n *nullui) PrintfUnescaped(f string, args ...interface{}) (int, error) {
+	return fmt.Printf(f, args...)
 }
 
 func (n *nullui) GetDumbOutputUI() DumbOutputUI {
@@ -464,12 +468,6 @@ func (f *FakeGregorDismisser) LocalDismissItem(ctx context.Context, id gregor.Ms
 	return nil
 }
 
-// ResetLoginState is only used for testing...
-// Bypasses locks.
-func (g *GlobalContext) ResetLoginState() {
-	g.createLoginStateLocked()
-}
-
 type TestUIDMapper struct {
 	ul UPAKLoader
 }
@@ -506,4 +504,14 @@ func (t TestUIDMapper) MapUIDsToUsernamePackages(ctx context.Context, g UIDMappe
 
 func (t TestUIDMapper) SetTestingNoCachingMode(enabled bool) {
 
+}
+
+func NewMetaContextForTest(tc TestContext) MetaContext {
+	return NewMetaContext(context.TODO(), tc.G).WithLogTag("TST")
+}
+
+func NewMetaContextForTestWithLogUI(tc TestContext) MetaContext {
+	return NewMetaContextForTest(tc).WithUIs(UIs{
+		LogUI: tc.G.UI.GetLogUI(),
+	})
 }

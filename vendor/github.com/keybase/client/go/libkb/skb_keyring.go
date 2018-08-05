@@ -244,6 +244,10 @@ func (k *SKBKeyringFile) saveLocked() error {
 		k.G().Log.Debug("SKBKeyringFile: saveLocked %s: not dirty, so skipping save", k.filename)
 		return nil
 	}
+	if err := MakeParentDirs(k.G().Log, k.filename); err != nil {
+		k.G().Log.Debug("SKBKeyringFile: saveLocked %s: failed to make parent dirs: %s", k.filename, err)
+		return err
+	}
 	k.G().Log.Debug("SKBKeyringFile: saveLocked %s: dirty, safe saving", k.filename)
 	if err := SafeWriteToFile(k.G().Log, k, 0); err != nil {
 		k.G().Log.Debug("SKBKeyringFile: saveLocked %s: SafeWriteToFile error: %s", k.filename, err)
@@ -336,58 +340,58 @@ func (k *SKBKeyringFile) WriteTo(w io.Writer) (int64, error) {
 	return 0, nil
 }
 
-func (k *SKBKeyringFile) Bug3964Repair(lctx LoginContext, lks *LKSec, dkm DeviceKeyMap) (ret *SKBKeyringFile, serverHalfSet *LKSecServerHalfSet, err error) {
-	defer k.G().Trace("SKBKeyringFile#Bug3964Repair", func() error { return err })()
+func (k *SKBKeyringFile) Bug3964Repair(m MetaContext, lks *LKSec, dkm DeviceKeyMap) (ret *SKBKeyringFile, serverHalfSet *LKSecServerHalfSet, err error) {
+	defer m.CTrace("SKBKeyringFile#Bug3964Repair", func() error { return err })()
 
 	var newBlocks []*SKB
 	var hitBug3964 bool
 
-	k.G().Log.Debug("| # of blocks=%d", len(k.Blocks))
+	m.CDebugf("| # of blocks=%d", len(k.Blocks))
 
 	for i, b := range k.Blocks {
 
 		if b.Priv.Data == nil {
-			k.G().Log.Debug("| Null private data at block=%d", i)
+			m.CDebugf("| Null private data at block=%d", i)
 			newBlocks = append(newBlocks, b)
 			continue
 		}
 
 		if b.Priv.Encryption != LKSecVersion {
-			k.G().Log.Debug("| Skipping non-LKSec encryption (%d) at block=%d", b.Priv.Encryption, i)
+			m.CDebugf("| Skipping non-LKSec encryption (%d) at block=%d", b.Priv.Encryption, i)
 			newBlocks = append(newBlocks, b)
 			continue
 		}
 
 		var decryption, reencryption []byte
 		var badMask LKSecServerHalf
-		decryption, badMask, err = lks.decryptForBug3964Repair(b.Priv.Data, dkm)
+		decryption, badMask, err = lks.decryptForBug3964Repair(m, b.Priv.Data, dkm)
 		if err != nil {
-			k.G().Log.Debug("| Decryption failed at block=%d; keeping as is (%s)", i, err)
+			m.CDebugf("| Decryption failed at block=%d; keeping as is (%s)", i, err)
 			newBlocks = append(newBlocks, b)
 			continue
 		}
 
 		if badMask.IsNil() {
-			k.G().Log.Debug("| Nil badmask at block=%d", i)
+			m.CDebugf("| Nil badmask at block=%d", i)
 			newBlocks = append(newBlocks, b)
 			continue
 		}
 
 		hitBug3964 = true
-		k.G().Log.Debug("| Hit bug 3964 at SKB block=%d", i)
+		m.CDebugf("| Hit bug 3964 at SKB block=%d", i)
 		if serverHalfSet == nil {
 			serverHalfSet = NewLKSecServerHalfSet()
 		}
 		serverHalfSet.Add(badMask)
 
-		reencryption, err = lks.Encrypt(decryption)
+		reencryption, err = lks.Encrypt(m, decryption)
 		if err != nil {
-			k.G().Log.Debug("| reencryption bug at block=%d", i)
+			m.CDebugf("| reencryption bug at block=%d", i)
 			return nil, nil, err
 		}
 
 		newSKB := &SKB{
-			Contextified: NewContextified(k.G()),
+			Contextified: NewContextified(m.G()),
 			Pub:          b.Pub,
 			Type:         b.Type,
 			Priv: SKBPriv{

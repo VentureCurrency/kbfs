@@ -58,6 +58,24 @@ type Engine interface {
 	// GetRootDir is called by the test harness to get a handle to a TLF from the given user's
 	// perspective
 	GetRootDir(u User, tlfName string, t tlf.Type, expectedCanonicalTlfName string) (dir Node, err error)
+	// GetRootDirAtRevision is called by the test harness to get a
+	// handle to an archived TLF from the given user's perspective, at
+	// a given revision.
+	GetRootDirAtRevision(
+		u User, tlfName string, t tlf.Type, rev kbfsmd.Revision,
+		expectedCanonicalTlfName string) (dir Node, err error)
+	// GetRootDirAtTimeString is called by the test harness to get a
+	// handle to an archived TLF from the given user's perspective, at
+	// a given time.
+	GetRootDirAtTimeString(
+		u User, tlfName string, t tlf.Type, timeString string,
+		expectedCanonicalTlfName string) (dir Node, err error)
+	// GetRootDirAtRelTimeString is called by the test harness to get
+	// a handle to an archived TLF from the given user's perspective,
+	// at a given relative time from now.
+	GetRootDirAtRelTimeString(
+		u User, tlfName string, t tlf.Type, relTimeString string,
+		expectedCanonicalTlfName string) (dir Node, err error)
 	// CreateDir is called by the test harness to create a directory relative to the passed
 	// parent directory for the given user.
 	CreateDir(u User, parentDir Node, name string) (dir Node, err error)
@@ -97,6 +115,9 @@ type Engine interface {
 	// GetMtime is called by the test harness as the given user to get
 	// the mtime of the given file.
 	GetMtime(u User, file Node) (mtime time.Time, err error)
+	// GetPrevResions is called by the test harness as the given user
+	// to get the previous revisions of the given file.
+	GetPrevRevisions(u User, file Node) (revs libkbfs.PrevRevisions, err error)
 	// SyncAll is called by the test harness as the given user to
 	// flush all writes buffered in memory to disk.
 	SyncAll(u User, tlfName string, t tlf.Type) (err error)
@@ -146,6 +167,9 @@ type Engine interface {
 	// paths haven't yet been flushed from the journal.
 	UnflushedPaths(u User, tlfName string, t tlf.Type) (
 		paths []string, err error)
+	// UserEditHistory called by the test harness to get the edit
+	// history for the given user.
+	UserEditHistory(u User) (history []keybase1.FSFolderEditHistory, err error)
 	// DirtyPaths called by the test harness to find out which
 	// paths haven't yet been flushed out of memory.
 	DirtyPaths(u User, tlfName string, t tlf.Type) (paths []string, err error)

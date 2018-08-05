@@ -57,6 +57,9 @@ type FS struct {
 	platformParams PlatformParams
 
 	quotaUsage *libkbfs.EventuallyConsistentQuotaUsage
+
+	inodeLock sync.Mutex
+	nextInode uint64
 }
 
 func makeTraceHandler(renderFn func(http.ResponseWriter, *http.Request, bool)) func(http.ResponseWriter, *http.Request) {
@@ -117,26 +120,38 @@ func NewFS(config libkbfs.Config, conn *fuse.Conn, debug bool, platformParams Pl
 		notifications:  libfs.NewFSNotifications(log),
 		platformParams: platformParams,
 		quotaUsage:     libkbfs.NewEventuallyConsistentQuotaUsage(config, "FS"),
+		nextInode:      2, // root is 1
 	}
 	fs.root.private = &FolderList{
 		fs:      fs,
 		tlfType: tlf.Private,
 		folders: make(map[string]*TLF),
+		inode:   fs.assignInode(),
 	}
 	fs.root.public = &FolderList{
 		fs:      fs,
 		tlfType: tlf.Public,
 		folders: make(map[string]*TLF),
+		inode:   fs.assignInode(),
 	}
 	fs.root.team = &FolderList{
 		fs:      fs,
 		tlfType: tlf.SingleTeam,
 		folders: make(map[string]*TLF),
+		inode:   fs.assignInode(),
 	}
 	fs.execAfterDelay = func(d time.Duration, f func()) {
 		time.AfterFunc(d, f)
 	}
 	return fs
+}
+
+func (f *FS) assignInode() uint64 {
+	f.inodeLock.Lock()
+	defer f.inodeLock.Unlock()
+	next := f.nextInode
+	f.nextInode++
+	return next
 }
 
 // tcpKeepAliveListener is copied from net/http/server.go, since it is
@@ -378,7 +393,7 @@ func (f *FS) Statfs(ctx context.Context, req *fuse.StatfsRequest, resp *fuse.Sta
 		// reading a public TLF while logged out can fail on macOS.
 		return nil
 	}
-	_, usageBytes, limitBytes, err := f.quotaUsage.Get(
+	_, usageBytes, _, limitBytes, err := f.quotaUsage.Get(
 		ctx, quotaUsageStaleTolerance/2, quotaUsageStaleTolerance)
 	if err != nil {
 		f.log.CDebugf(ctx, "Getting quota usage error: %v", err)
@@ -427,6 +442,7 @@ var _ fs.Node = (*Root)(nil)
 // Attr implements the fs.Node interface for Root.
 func (*Root) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mode = os.ModeDir | 0500
+	a.Inode = 1
 	return nil
 }
 

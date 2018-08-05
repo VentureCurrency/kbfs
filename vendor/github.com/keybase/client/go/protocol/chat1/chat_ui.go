@@ -31,15 +31,17 @@ type UnverifiedInboxUIItemMetadata struct {
 	ChannelName       string   `codec:"channelName" json:"channelName"`
 	Headline          string   `codec:"headline" json:"headline"`
 	Snippet           string   `codec:"snippet" json:"snippet"`
+	SnippetDecoration string   `codec:"snippetDecoration" json:"snippetDecoration"`
 	WriterNames       []string `codec:"writerNames" json:"writerNames"`
 	ResetParticipants []string `codec:"resetParticipants" json:"resetParticipants"`
 }
 
 func (o UnverifiedInboxUIItemMetadata) DeepCopy() UnverifiedInboxUIItemMetadata {
 	return UnverifiedInboxUIItemMetadata{
-		ChannelName: o.ChannelName,
-		Headline:    o.Headline,
-		Snippet:     o.Snippet,
+		ChannelName:       o.ChannelName,
+		Headline:          o.Headline,
+		Snippet:           o.Snippet,
+		SnippetDecoration: o.SnippetDecoration,
 		WriterNames: (func(x []string) []string {
 			if x == nil {
 				return nil
@@ -67,6 +69,7 @@ func (o UnverifiedInboxUIItemMetadata) DeepCopy() UnverifiedInboxUIItemMetadata 
 
 type UnverifiedInboxUIItem struct {
 	ConvID        string                         `codec:"convID" json:"convID"`
+	TopicType     TopicType                      `codec:"topicType" json:"topicType"`
 	Name          string                         `codec:"name" json:"name"`
 	Visibility    keybase1.TLFVisibility         `codec:"visibility" json:"visibility"`
 	Status        ConversationStatus             `codec:"status" json:"status"`
@@ -77,12 +80,17 @@ type UnverifiedInboxUIItem struct {
 	Time          gregor1.Time                   `codec:"time" json:"time"`
 	Version       ConversationVers               `codec:"version" json:"version"`
 	MaxMsgID      MessageID                      `codec:"maxMsgID" json:"maxMsgID"`
+	ReadMsgID     MessageID                      `codec:"readMsgID" json:"readMsgID"`
 	LocalMetadata *UnverifiedInboxUIItemMetadata `codec:"localMetadata,omitempty" json:"localMetadata,omitempty"`
+	FinalizeInfo  *ConversationFinalizeInfo      `codec:"finalizeInfo,omitempty" json:"finalizeInfo,omitempty"`
+	Supersedes    []ConversationMetadata         `codec:"supersedes" json:"supersedes"`
+	SupersededBy  []ConversationMetadata         `codec:"supersededBy" json:"supersededBy"`
 }
 
 func (o UnverifiedInboxUIItem) DeepCopy() UnverifiedInboxUIItem {
 	return UnverifiedInboxUIItem{
 		ConvID:       o.ConvID,
+		TopicType:    o.TopicType.DeepCopy(),
 		Name:         o.Name,
 		Visibility:   o.Visibility.DeepCopy(),
 		Status:       o.Status.DeepCopy(),
@@ -96,9 +104,10 @@ func (o UnverifiedInboxUIItem) DeepCopy() UnverifiedInboxUIItem {
 			tmp := (*x).DeepCopy()
 			return &tmp
 		})(o.Notifications),
-		Time:     o.Time.DeepCopy(),
-		Version:  o.Version.DeepCopy(),
-		MaxMsgID: o.MaxMsgID.DeepCopy(),
+		Time:      o.Time.DeepCopy(),
+		Version:   o.Version.DeepCopy(),
+		MaxMsgID:  o.MaxMsgID.DeepCopy(),
+		ReadMsgID: o.ReadMsgID.DeepCopy(),
 		LocalMetadata: (func(x *UnverifiedInboxUIItemMetadata) *UnverifiedInboxUIItemMetadata {
 			if x == nil {
 				return nil
@@ -106,6 +115,35 @@ func (o UnverifiedInboxUIItem) DeepCopy() UnverifiedInboxUIItem {
 			tmp := (*x).DeepCopy()
 			return &tmp
 		})(o.LocalMetadata),
+		FinalizeInfo: (func(x *ConversationFinalizeInfo) *ConversationFinalizeInfo {
+			if x == nil {
+				return nil
+			}
+			tmp := (*x).DeepCopy()
+			return &tmp
+		})(o.FinalizeInfo),
+		Supersedes: (func(x []ConversationMetadata) []ConversationMetadata {
+			if x == nil {
+				return nil
+			}
+			var ret []ConversationMetadata
+			for _, v := range x {
+				vCopy := v.DeepCopy()
+				ret = append(ret, vCopy)
+			}
+			return ret
+		})(o.Supersedes),
+		SupersededBy: (func(x []ConversationMetadata) []ConversationMetadata {
+			if x == nil {
+				return nil
+			}
+			var ret []ConversationMetadata
+			for _, v := range x {
+				vCopy := v.DeepCopy()
+				ret = append(ret, vCopy)
+			}
+			return ret
+		})(o.SupersededBy),
 	}
 }
 
@@ -141,9 +179,11 @@ func (o UnverifiedInboxUIItems) DeepCopy() UnverifiedInboxUIItems {
 
 type InboxUIItem struct {
 	ConvID            string                        `codec:"convID" json:"convID"`
+	TopicType         TopicType                     `codec:"topicType" json:"topicType"`
 	IsEmpty           bool                          `codec:"isEmpty" json:"isEmpty"`
 	Name              string                        `codec:"name" json:"name"`
 	Snippet           string                        `codec:"snippet" json:"snippet"`
+	SnippetDecoration string                        `codec:"snippetDecoration" json:"snippetDecoration"`
 	Channel           string                        `codec:"channel" json:"channel"`
 	Headline          string                        `codec:"headline" json:"headline"`
 	Visibility        keybase1.TLFVisibility        `codec:"visibility" json:"visibility"`
@@ -159,8 +199,10 @@ type InboxUIItem struct {
 	CreatorInfo       *ConversationCreatorInfoLocal `codec:"creatorInfo,omitempty" json:"creatorInfo,omitempty"`
 	Version           ConversationVers              `codec:"version" json:"version"`
 	MaxMsgID          MessageID                     `codec:"maxMsgID" json:"maxMsgID"`
+	ReadMsgID         MessageID                     `codec:"readMsgID" json:"readMsgID"`
 	ConvRetention     *RetentionPolicy              `codec:"convRetention,omitempty" json:"convRetention,omitempty"`
 	TeamRetention     *RetentionPolicy              `codec:"teamRetention,omitempty" json:"teamRetention,omitempty"`
+	ConvSettings      *ConversationSettingsLocal    `codec:"convSettings,omitempty" json:"convSettings,omitempty"`
 	FinalizeInfo      *ConversationFinalizeInfo     `codec:"finalizeInfo,omitempty" json:"finalizeInfo,omitempty"`
 	Supersedes        []ConversationMetadata        `codec:"supersedes" json:"supersedes"`
 	SupersededBy      []ConversationMetadata        `codec:"supersededBy" json:"supersededBy"`
@@ -168,13 +210,15 @@ type InboxUIItem struct {
 
 func (o InboxUIItem) DeepCopy() InboxUIItem {
 	return InboxUIItem{
-		ConvID:     o.ConvID,
-		IsEmpty:    o.IsEmpty,
-		Name:       o.Name,
-		Snippet:    o.Snippet,
-		Channel:    o.Channel,
-		Headline:   o.Headline,
-		Visibility: o.Visibility.DeepCopy(),
+		ConvID:            o.ConvID,
+		TopicType:         o.TopicType.DeepCopy(),
+		IsEmpty:           o.IsEmpty,
+		Name:              o.Name,
+		Snippet:           o.Snippet,
+		SnippetDecoration: o.SnippetDecoration,
+		Channel:           o.Channel,
+		Headline:          o.Headline,
+		Visibility:        o.Visibility.DeepCopy(),
 		Participants: (func(x []string) []string {
 			if x == nil {
 				return nil
@@ -228,8 +272,9 @@ func (o InboxUIItem) DeepCopy() InboxUIItem {
 			tmp := (*x).DeepCopy()
 			return &tmp
 		})(o.CreatorInfo),
-		Version:  o.Version.DeepCopy(),
-		MaxMsgID: o.MaxMsgID.DeepCopy(),
+		Version:   o.Version.DeepCopy(),
+		MaxMsgID:  o.MaxMsgID.DeepCopy(),
+		ReadMsgID: o.ReadMsgID.DeepCopy(),
 		ConvRetention: (func(x *RetentionPolicy) *RetentionPolicy {
 			if x == nil {
 				return nil
@@ -244,6 +289,13 @@ func (o InboxUIItem) DeepCopy() InboxUIItem {
 			tmp := (*x).DeepCopy()
 			return &tmp
 		})(o.TeamRetention),
+		ConvSettings: (func(x *ConversationSettingsLocal) *ConversationSettingsLocal {
+			if x == nil {
+				return nil
+			}
+			tmp := (*x).DeepCopy()
+			return &tmp
+		})(o.ConvSettings),
 		FinalizeInfo: (func(x *ConversationFinalizeInfo) *ConversationFinalizeInfo {
 			if x == nil {
 				return nil
@@ -273,6 +325,30 @@ func (o InboxUIItem) DeepCopy() InboxUIItem {
 			}
 			return ret
 		})(o.SupersededBy),
+	}
+}
+
+type InboxUIItemError struct {
+	Typ               ConversationErrorType   `codec:"typ" json:"typ"`
+	Message           string                  `codec:"message" json:"message"`
+	UnverifiedTLFName string                  `codec:"unverifiedTLFName" json:"unverifiedTLFName"`
+	RekeyInfo         *ConversationErrorRekey `codec:"rekeyInfo,omitempty" json:"rekeyInfo,omitempty"`
+	RemoteConv        UnverifiedInboxUIItem   `codec:"remoteConv" json:"remoteConv"`
+}
+
+func (o InboxUIItemError) DeepCopy() InboxUIItemError {
+	return InboxUIItemError{
+		Typ:               o.Typ.DeepCopy(),
+		Message:           o.Message,
+		UnverifiedTLFName: o.UnverifiedTLFName,
+		RekeyInfo: (func(x *ConversationErrorRekey) *ConversationErrorRekey {
+			if x == nil {
+				return nil
+			}
+			tmp := (*x).DeepCopy()
+			return &tmp
+		})(o.RekeyInfo),
+		RemoteConv: o.RemoteConv.DeepCopy(),
 	}
 }
 
@@ -318,6 +394,20 @@ func (o UIChannelNameMention) DeepCopy() UIChannelNameMention {
 	}
 }
 
+type UIAssetUrlInfo struct {
+	PreviewUrl string `codec:"previewUrl" json:"previewUrl"`
+	FullUrl    string `codec:"fullUrl" json:"fullUrl"`
+	MimeType   string `codec:"mimeType" json:"mimeType"`
+}
+
+func (o UIAssetUrlInfo) DeepCopy() UIAssetUrlInfo {
+	return UIAssetUrlInfo{
+		PreviewUrl: o.PreviewUrl,
+		FullUrl:    o.FullUrl,
+		MimeType:   o.MimeType,
+	}
+}
+
 type UIMessageValid struct {
 	MessageID             MessageID              `codec:"messageID" json:"messageID"`
 	Ctime                 gregor1.Time           `codec:"ctime" json:"ctime"`
@@ -327,10 +417,17 @@ type UIMessageValid struct {
 	SenderDeviceName      string                 `codec:"senderDeviceName" json:"senderDeviceName"`
 	SenderDeviceType      string                 `codec:"senderDeviceType" json:"senderDeviceType"`
 	Superseded            bool                   `codec:"superseded" json:"superseded"`
+	AssetUrlInfo          *UIAssetUrlInfo        `codec:"assetUrlInfo,omitempty" json:"assetUrlInfo,omitempty"`
 	SenderDeviceRevokedAt *gregor1.Time          `codec:"senderDeviceRevokedAt,omitempty" json:"senderDeviceRevokedAt,omitempty"`
 	AtMentions            []string               `codec:"atMentions" json:"atMentions"`
 	ChannelMention        ChannelMention         `codec:"channelMention" json:"channelMention"`
 	ChannelNameMentions   []UIChannelNameMention `codec:"channelNameMentions" json:"channelNameMentions"`
+	IsEphemeral           bool                   `codec:"isEphemeral" json:"isEphemeral"`
+	IsEphemeralExpired    bool                   `codec:"isEphemeralExpired" json:"isEphemeralExpired"`
+	ExplodedBy            *string                `codec:"explodedBy,omitempty" json:"explodedBy,omitempty"`
+	Etime                 gregor1.Time           `codec:"etime" json:"etime"`
+	Reactions             ReactionMap            `codec:"reactions" json:"reactions"`
+	HasPairwiseMacs       bool                   `codec:"hasPairwiseMacs" json:"hasPairwiseMacs"`
 }
 
 func (o UIMessageValid) DeepCopy() UIMessageValid {
@@ -349,6 +446,13 @@ func (o UIMessageValid) DeepCopy() UIMessageValid {
 		SenderDeviceName: o.SenderDeviceName,
 		SenderDeviceType: o.SenderDeviceType,
 		Superseded:       o.Superseded,
+		AssetUrlInfo: (func(x *UIAssetUrlInfo) *UIAssetUrlInfo {
+			if x == nil {
+				return nil
+			}
+			tmp := (*x).DeepCopy()
+			return &tmp
+		})(o.AssetUrlInfo),
 		SenderDeviceRevokedAt: (func(x *gregor1.Time) *gregor1.Time {
 			if x == nil {
 				return nil
@@ -379,16 +483,29 @@ func (o UIMessageValid) DeepCopy() UIMessageValid {
 			}
 			return ret
 		})(o.ChannelNameMentions),
+		IsEphemeral:        o.IsEphemeral,
+		IsEphemeralExpired: o.IsEphemeralExpired,
+		ExplodedBy: (func(x *string) *string {
+			if x == nil {
+				return nil
+			}
+			tmp := (*x)
+			return &tmp
+		})(o.ExplodedBy),
+		Etime:           o.Etime.DeepCopy(),
+		Reactions:       o.Reactions.DeepCopy(),
+		HasPairwiseMacs: o.HasPairwiseMacs,
 	}
 }
 
 type UIMessageOutbox struct {
-	State       OutboxState  `codec:"state" json:"state"`
-	OutboxID    string       `codec:"outboxID" json:"outboxID"`
-	MessageType MessageType  `codec:"messageType" json:"messageType"`
-	Body        string       `codec:"body" json:"body"`
-	Ctime       gregor1.Time `codec:"ctime" json:"ctime"`
-	Ordinal     float64      `codec:"ordinal" json:"ordinal"`
+	State       OutboxState     `codec:"state" json:"state"`
+	OutboxID    string          `codec:"outboxID" json:"outboxID"`
+	MessageType MessageType     `codec:"messageType" json:"messageType"`
+	Body        string          `codec:"body" json:"body"`
+	Ctime       gregor1.Time    `codec:"ctime" json:"ctime"`
+	Ordinal     float64         `codec:"ordinal" json:"ordinal"`
+	Preview     *MakePreviewRes `codec:"preview,omitempty" json:"preview,omitempty"`
 }
 
 func (o UIMessageOutbox) DeepCopy() UIMessageOutbox {
@@ -399,6 +516,13 @@ func (o UIMessageOutbox) DeepCopy() UIMessageOutbox {
 		Body:        o.Body,
 		Ctime:       o.Ctime.DeepCopy(),
 		Ordinal:     o.Ordinal,
+		Preview: (func(x *MakePreviewRes) *MakePreviewRes {
+			if x == nil {
+				return nil
+			}
+			tmp := (*x).DeepCopy()
+			return &tmp
+		})(o.Preview),
 	}
 }
 
@@ -598,34 +722,50 @@ func (o UIMessages) DeepCopy() UIMessages {
 	}
 }
 
-type ChatAttachmentUploadOutboxIDArg struct {
-	SessionID int      `codec:"sessionID" json:"sessionID"`
-	OutboxID  OutboxID `codec:"outboxID" json:"outboxID"`
+type ChatSearchHit struct {
+	BeforeMessages []UIMessage `codec:"beforeMessages" json:"beforeMessages"`
+	HitMessage     UIMessage   `codec:"hitMessage" json:"hitMessage"`
+	AfterMessages  []UIMessage `codec:"afterMessages" json:"afterMessages"`
+	Matches        []string    `codec:"matches" json:"matches"`
 }
 
-type ChatAttachmentUploadStartArg struct {
-	SessionID        int           `codec:"sessionID" json:"sessionID"`
-	Metadata         AssetMetadata `codec:"metadata" json:"metadata"`
-	PlaceholderMsgID MessageID     `codec:"placeholderMsgID" json:"placeholderMsgID"`
-}
-
-type ChatAttachmentUploadProgressArg struct {
-	SessionID     int   `codec:"sessionID" json:"sessionID"`
-	BytesComplete int64 `codec:"bytesComplete" json:"bytesComplete"`
-	BytesTotal    int64 `codec:"bytesTotal" json:"bytesTotal"`
-}
-
-type ChatAttachmentUploadDoneArg struct {
-	SessionID int `codec:"sessionID" json:"sessionID"`
-}
-
-type ChatAttachmentPreviewUploadStartArg struct {
-	SessionID int           `codec:"sessionID" json:"sessionID"`
-	Metadata  AssetMetadata `codec:"metadata" json:"metadata"`
-}
-
-type ChatAttachmentPreviewUploadDoneArg struct {
-	SessionID int `codec:"sessionID" json:"sessionID"`
+func (o ChatSearchHit) DeepCopy() ChatSearchHit {
+	return ChatSearchHit{
+		BeforeMessages: (func(x []UIMessage) []UIMessage {
+			if x == nil {
+				return nil
+			}
+			var ret []UIMessage
+			for _, v := range x {
+				vCopy := v.DeepCopy()
+				ret = append(ret, vCopy)
+			}
+			return ret
+		})(o.BeforeMessages),
+		HitMessage: o.HitMessage.DeepCopy(),
+		AfterMessages: (func(x []UIMessage) []UIMessage {
+			if x == nil {
+				return nil
+			}
+			var ret []UIMessage
+			for _, v := range x {
+				vCopy := v.DeepCopy()
+				ret = append(ret, vCopy)
+			}
+			return ret
+		})(o.AfterMessages),
+		Matches: (func(x []string) []string {
+			if x == nil {
+				return nil
+			}
+			var ret []string
+			for _, v := range x {
+				vCopy := v
+				ret = append(ret, vCopy)
+			}
+			return ret
+		})(o.Matches),
+	}
 }
 
 type ChatAttachmentDownloadStartArg struct {
@@ -653,9 +793,9 @@ type ChatInboxConversationArg struct {
 }
 
 type ChatInboxFailedArg struct {
-	SessionID int                    `codec:"sessionID" json:"sessionID"`
-	ConvID    ConversationID         `codec:"convID" json:"convID"`
-	Error     ConversationErrorLocal `codec:"error" json:"error"`
+	SessionID int              `codec:"sessionID" json:"sessionID"`
+	ConvID    ConversationID   `codec:"convID" json:"convID"`
+	Error     InboxUIItemError `codec:"error" json:"error"`
 }
 
 type ChatThreadCachedArg struct {
@@ -668,18 +808,22 @@ type ChatThreadFullArg struct {
 	Thread    string `codec:"thread" json:"thread"`
 }
 
+type ChatSearchHitArg struct {
+	SessionID int           `codec:"sessionID" json:"sessionID"`
+	SearchHit ChatSearchHit `codec:"searchHit" json:"searchHit"`
+}
+
+type ChatSearchDoneArg struct {
+	SessionID int `codec:"sessionID" json:"sessionID"`
+	NumHits   int `codec:"numHits" json:"numHits"`
+}
+
 type ChatConfirmChannelDeleteArg struct {
 	SessionID int    `codec:"sessionID" json:"sessionID"`
 	Channel   string `codec:"channel" json:"channel"`
 }
 
 type ChatUiInterface interface {
-	ChatAttachmentUploadOutboxID(context.Context, ChatAttachmentUploadOutboxIDArg) error
-	ChatAttachmentUploadStart(context.Context, ChatAttachmentUploadStartArg) error
-	ChatAttachmentUploadProgress(context.Context, ChatAttachmentUploadProgressArg) error
-	ChatAttachmentUploadDone(context.Context, int) error
-	ChatAttachmentPreviewUploadStart(context.Context, ChatAttachmentPreviewUploadStartArg) error
-	ChatAttachmentPreviewUploadDone(context.Context, int) error
 	ChatAttachmentDownloadStart(context.Context, int) error
 	ChatAttachmentDownloadProgress(context.Context, ChatAttachmentDownloadProgressArg) error
 	ChatAttachmentDownloadDone(context.Context, int) error
@@ -688,6 +832,8 @@ type ChatUiInterface interface {
 	ChatInboxFailed(context.Context, ChatInboxFailedArg) error
 	ChatThreadCached(context.Context, ChatThreadCachedArg) error
 	ChatThreadFull(context.Context, ChatThreadFullArg) error
+	ChatSearchHit(context.Context, ChatSearchHitArg) error
+	ChatSearchDone(context.Context, ChatSearchDoneArg) error
 	ChatConfirmChannelDelete(context.Context, ChatConfirmChannelDeleteArg) (bool, error)
 }
 
@@ -695,102 +841,6 @@ func ChatUiProtocol(i ChatUiInterface) rpc.Protocol {
 	return rpc.Protocol{
 		Name: "chat.1.chatUi",
 		Methods: map[string]rpc.ServeHandlerDescription{
-			"chatAttachmentUploadOutboxID": {
-				MakeArg: func() interface{} {
-					ret := make([]ChatAttachmentUploadOutboxIDArg, 1)
-					return &ret
-				},
-				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
-					typedArgs, ok := args.(*[]ChatAttachmentUploadOutboxIDArg)
-					if !ok {
-						err = rpc.NewTypeError((*[]ChatAttachmentUploadOutboxIDArg)(nil), args)
-						return
-					}
-					err = i.ChatAttachmentUploadOutboxID(ctx, (*typedArgs)[0])
-					return
-				},
-				MethodType: rpc.MethodCall,
-			},
-			"chatAttachmentUploadStart": {
-				MakeArg: func() interface{} {
-					ret := make([]ChatAttachmentUploadStartArg, 1)
-					return &ret
-				},
-				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
-					typedArgs, ok := args.(*[]ChatAttachmentUploadStartArg)
-					if !ok {
-						err = rpc.NewTypeError((*[]ChatAttachmentUploadStartArg)(nil), args)
-						return
-					}
-					err = i.ChatAttachmentUploadStart(ctx, (*typedArgs)[0])
-					return
-				},
-				MethodType: rpc.MethodNotify,
-			},
-			"chatAttachmentUploadProgress": {
-				MakeArg: func() interface{} {
-					ret := make([]ChatAttachmentUploadProgressArg, 1)
-					return &ret
-				},
-				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
-					typedArgs, ok := args.(*[]ChatAttachmentUploadProgressArg)
-					if !ok {
-						err = rpc.NewTypeError((*[]ChatAttachmentUploadProgressArg)(nil), args)
-						return
-					}
-					err = i.ChatAttachmentUploadProgress(ctx, (*typedArgs)[0])
-					return
-				},
-				MethodType: rpc.MethodNotify,
-			},
-			"chatAttachmentUploadDone": {
-				MakeArg: func() interface{} {
-					ret := make([]ChatAttachmentUploadDoneArg, 1)
-					return &ret
-				},
-				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
-					typedArgs, ok := args.(*[]ChatAttachmentUploadDoneArg)
-					if !ok {
-						err = rpc.NewTypeError((*[]ChatAttachmentUploadDoneArg)(nil), args)
-						return
-					}
-					err = i.ChatAttachmentUploadDone(ctx, (*typedArgs)[0].SessionID)
-					return
-				},
-				MethodType: rpc.MethodCall,
-			},
-			"chatAttachmentPreviewUploadStart": {
-				MakeArg: func() interface{} {
-					ret := make([]ChatAttachmentPreviewUploadStartArg, 1)
-					return &ret
-				},
-				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
-					typedArgs, ok := args.(*[]ChatAttachmentPreviewUploadStartArg)
-					if !ok {
-						err = rpc.NewTypeError((*[]ChatAttachmentPreviewUploadStartArg)(nil), args)
-						return
-					}
-					err = i.ChatAttachmentPreviewUploadStart(ctx, (*typedArgs)[0])
-					return
-				},
-				MethodType: rpc.MethodNotify,
-			},
-			"chatAttachmentPreviewUploadDone": {
-				MakeArg: func() interface{} {
-					ret := make([]ChatAttachmentPreviewUploadDoneArg, 1)
-					return &ret
-				},
-				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
-					typedArgs, ok := args.(*[]ChatAttachmentPreviewUploadDoneArg)
-					if !ok {
-						err = rpc.NewTypeError((*[]ChatAttachmentPreviewUploadDoneArg)(nil), args)
-						return
-					}
-					err = i.ChatAttachmentPreviewUploadDone(ctx, (*typedArgs)[0].SessionID)
-					return
-				},
-				MethodType: rpc.MethodCall,
-			},
 			"chatAttachmentDownloadStart": {
 				MakeArg: func() interface{} {
 					ret := make([]ChatAttachmentDownloadStartArg, 1)
@@ -919,6 +969,38 @@ func ChatUiProtocol(i ChatUiInterface) rpc.Protocol {
 				},
 				MethodType: rpc.MethodNotify,
 			},
+			"chatSearchHit": {
+				MakeArg: func() interface{} {
+					ret := make([]ChatSearchHitArg, 1)
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[]ChatSearchHitArg)
+					if !ok {
+						err = rpc.NewTypeError((*[]ChatSearchHitArg)(nil), args)
+						return
+					}
+					err = i.ChatSearchHit(ctx, (*typedArgs)[0])
+					return
+				},
+				MethodType: rpc.MethodCall,
+			},
+			"chatSearchDone": {
+				MakeArg: func() interface{} {
+					ret := make([]ChatSearchDoneArg, 1)
+					return &ret
+				},
+				Handler: func(ctx context.Context, args interface{}) (ret interface{}, err error) {
+					typedArgs, ok := args.(*[]ChatSearchDoneArg)
+					if !ok {
+						err = rpc.NewTypeError((*[]ChatSearchDoneArg)(nil), args)
+						return
+					}
+					err = i.ChatSearchDone(ctx, (*typedArgs)[0])
+					return
+				},
+				MethodType: rpc.MethodCall,
+			},
 			"chatConfirmChannelDelete": {
 				MakeArg: func() interface{} {
 					ret := make([]ChatConfirmChannelDeleteArg, 1)
@@ -941,38 +1023,6 @@ func ChatUiProtocol(i ChatUiInterface) rpc.Protocol {
 
 type ChatUiClient struct {
 	Cli rpc.GenericClient
-}
-
-func (c ChatUiClient) ChatAttachmentUploadOutboxID(ctx context.Context, __arg ChatAttachmentUploadOutboxIDArg) (err error) {
-	err = c.Cli.Call(ctx, "chat.1.chatUi.chatAttachmentUploadOutboxID", []interface{}{__arg}, nil)
-	return
-}
-
-func (c ChatUiClient) ChatAttachmentUploadStart(ctx context.Context, __arg ChatAttachmentUploadStartArg) (err error) {
-	err = c.Cli.Notify(ctx, "chat.1.chatUi.chatAttachmentUploadStart", []interface{}{__arg})
-	return
-}
-
-func (c ChatUiClient) ChatAttachmentUploadProgress(ctx context.Context, __arg ChatAttachmentUploadProgressArg) (err error) {
-	err = c.Cli.Notify(ctx, "chat.1.chatUi.chatAttachmentUploadProgress", []interface{}{__arg})
-	return
-}
-
-func (c ChatUiClient) ChatAttachmentUploadDone(ctx context.Context, sessionID int) (err error) {
-	__arg := ChatAttachmentUploadDoneArg{SessionID: sessionID}
-	err = c.Cli.Call(ctx, "chat.1.chatUi.chatAttachmentUploadDone", []interface{}{__arg}, nil)
-	return
-}
-
-func (c ChatUiClient) ChatAttachmentPreviewUploadStart(ctx context.Context, __arg ChatAttachmentPreviewUploadStartArg) (err error) {
-	err = c.Cli.Notify(ctx, "chat.1.chatUi.chatAttachmentPreviewUploadStart", []interface{}{__arg})
-	return
-}
-
-func (c ChatUiClient) ChatAttachmentPreviewUploadDone(ctx context.Context, sessionID int) (err error) {
-	__arg := ChatAttachmentPreviewUploadDoneArg{SessionID: sessionID}
-	err = c.Cli.Call(ctx, "chat.1.chatUi.chatAttachmentPreviewUploadDone", []interface{}{__arg}, nil)
-	return
 }
 
 func (c ChatUiClient) ChatAttachmentDownloadStart(ctx context.Context, sessionID int) (err error) {
@@ -1014,6 +1064,16 @@ func (c ChatUiClient) ChatThreadCached(ctx context.Context, __arg ChatThreadCach
 
 func (c ChatUiClient) ChatThreadFull(ctx context.Context, __arg ChatThreadFullArg) (err error) {
 	err = c.Cli.Notify(ctx, "chat.1.chatUi.chatThreadFull", []interface{}{__arg})
+	return
+}
+
+func (c ChatUiClient) ChatSearchHit(ctx context.Context, __arg ChatSearchHitArg) (err error) {
+	err = c.Cli.Call(ctx, "chat.1.chatUi.chatSearchHit", []interface{}{__arg}, nil)
+	return
+}
+
+func (c ChatUiClient) ChatSearchDone(ctx context.Context, __arg ChatSearchDoneArg) (err error) {
+	err = c.Cli.Call(ctx, "chat.1.chatUi.chatSearchDone", []interface{}{__arg}, nil)
 	return
 }
 

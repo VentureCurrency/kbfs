@@ -16,6 +16,7 @@ import (
 	"github.com/keybase/kbfs/kbfscodec"
 	"github.com/keybase/kbfs/kbfscrypto"
 	"github.com/keybase/kbfs/kbfsmd"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -51,8 +52,8 @@ func makeTestKBPKIClientWithRevokedKey(t *testing.T, revokeTime time.Time) (
 		index := 99
 		keySalt := keySaltForUserDevice(user.Name, index)
 		newVerifyingKey := MakeLocalUserVerifyingKeyOrBust(keySalt)
-		user.RevokedVerifyingKeys = map[kbfscrypto.VerifyingKey]keybase1.KeybaseTime{
-			newVerifyingKey: {Unix: keybase1.ToTime(revokeTime), Chain: 100},
+		user.RevokedVerifyingKeys = map[kbfscrypto.VerifyingKey]revokedKeyInfo{
+			newVerifyingKey: {Time: keybase1.ToTime(revokeTime)},
 		}
 		users[i] = user
 	}
@@ -116,7 +117,7 @@ func TestKBPKIClientHasRevokedVerifyingKey(t *testing.T) {
 	// Something verified before the key was revoked
 	err := c.HasVerifyingKey(context.Background(), keybase1.MakeTestUID(1),
 		revokedKey, revokeTime.Add(-10*time.Second))
-	if err != nil {
+	if _, ok := errors.Cause(err).(RevokedDeviceVerificationError); !ok {
 		t.Error(err)
 	}
 
@@ -218,47 +219,5 @@ func TestKBPKIClientGetTeamTLFCryptKeys(t *testing.T) {
 		if keyGen != kbfsmd.FirstValidKeyGen {
 			t.Errorf("Unexpected team key gen: %v", keyGen)
 		}
-	}
-}
-
-func makeTestKBPKIClientWithUnverifiedKey(t *testing.T) (
-	client *KBPKIClient, currentUID keybase1.UID, users []LocalUser) {
-	currentUID = keybase1.MakeTestUID(1)
-	names := []libkb.NormalizedUsername{"test_name1", "test_name2"}
-	users = MakeLocalUsers(names)
-	// Give each user an unverified key
-	for i, user := range users {
-		index := 99
-		keySalt := keySaltForUserDevice(user.Name, index)
-		newVerifyingKey := MakeLocalUserVerifyingKeyOrBust(keySalt)
-		key := keybase1.PublicKey{KID: newVerifyingKey.KID()}
-		user.UnverifiedKeys = []keybase1.PublicKey{key}
-		users[i] = user
-	}
-	codec := kbfscodec.NewMsgpack()
-	daemon := NewKeybaseDaemonMemory(currentUID, users, nil, codec)
-	return NewKBPKIClient(keybaseServiceSelfOwner{daemon},
-		logger.NewTestLogger(t)), currentUID, users
-}
-
-func TestKBPKIClientHasUnverifiedVerifyingKey(t *testing.T) {
-	c, _, localUsers := makeTestKBPKIClientWithUnverifiedKey(t)
-
-	var unverifiedKey kbfscrypto.VerifyingKey
-	for _, k := range localUsers[0].UnverifiedKeys {
-		unverifiedKey = kbfscrypto.MakeVerifyingKey(k.KID)
-		break
-	}
-
-	err := c.HasVerifyingKey(context.Background(), keybase1.MakeTestUID(1),
-		unverifiedKey, time.Time{})
-	if err == nil {
-		t.Error("HasVerifyingKey unexpectedly succeeded")
-	}
-
-	err = c.HasUnverifiedVerifyingKey(context.Background(), keybase1.MakeTestUID(1),
-		unverifiedKey)
-	if err != nil {
-		t.Fatal(err)
 	}
 }

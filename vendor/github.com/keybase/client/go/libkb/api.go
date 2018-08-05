@@ -40,13 +40,20 @@ type ExternalAPIEngine struct {
 	BaseAPIEngine
 }
 
+type AppStatusEmbed struct {
+	Status AppStatus `json:"status"`
+}
+
+func (s *AppStatusEmbed) GetAppStatus() *AppStatus {
+	return &s.Status
+}
+
 // Internal and External APIs both implement these methods,
 // allowing us to share the request-making code below in doRequest
 type Requester interface {
-	Contextifier
-	fixHeaders(arg APIArg, req *http.Request) error
+	fixHeaders(m MetaContext, arg APIArg, req *http.Request, nist *NIST) error
 	getCli(needSession bool) *Client
-	consumeHeaders(resp *http.Response) error
+	consumeHeaders(m MetaContext, resp *http.Response, nist *NIST) error
 	isExternal() bool
 }
 
@@ -209,30 +216,47 @@ func (c *countingReader) numRead() int {
 
 func noopFinisher() {}
 
+func getNIST(m MetaContext, sessType APISessionType) *NIST {
+	if sessType == APISessionTypeNONE {
+		return nil
+	}
+
+	if !m.G().Env.GetTorMode().UseSession() {
+		return nil
+	}
+
+	nist, err := m.ActiveDevice().NIST(m.Ctx())
+	if nist == nil {
+		m.CDebugf("active device couldn't generate a NIST")
+		return nil
+	}
+
+	if err != nil {
+		m.CDebugf("Error generating NIST: %s", err)
+		return nil
+	}
+	return nist
+}
+
 // doRequestShared returns an http.Response, which is a live streaming object that
 // escapes the function in which it was created.  It therefore also returns
 // a `finisher func()` that *must always be called* after the response is no longer
 // needed. This finisher is always non-nil (and just a noop in some cases),
 // so therefore it's fine to call it without checking for nil-ness.
-func doRequestShared(api Requester, arg APIArg, req *http.Request, wantJSONRes bool) (_ *http.Response, finisher func(), jw *jsonw.Wrapper, err error) {
-	if !api.G().Env.GetTorMode().UseSession() && arg.SessionType == APISessionTypeREQUIRED {
+func doRequestShared(m MetaContext, api Requester, arg APIArg, req *http.Request, wantJSONRes bool) (_ *http.Response, finisher func(), jw *jsonw.Wrapper, err error) {
+	if !m.G().Env.GetTorMode().UseSession() && arg.SessionType == APISessionTypeREQUIRED {
 		err = TorSessionRequiredError{}
 		return
 	}
 
+	m = m.EnsureCtx().WithLogTag("API")
+
 	finisher = noopFinisher
 
-	ctx := arg.NetContext
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	ctx = WithLogTag(ctx, "API")
-	arg.NetContext = ctx
+	nist := getNIST(m, arg.SessionType)
 
-	api.G().Log.CDebugf(ctx, "+ API %s %s", req.Method, req.URL)
-
-	if err = api.fixHeaders(arg, req); err != nil {
-		api.G().Log.CDebugf(ctx, "- API %s %s: fixHeaders error: %s", req.Method, req.URL, err)
+	if err = api.fixHeaders(m, arg, req, nist); err != nil {
+		m.CDebugf("- API %s %s: fixHeaders error: %s", req.Method, req.URL, err)
 		return
 	}
 	needSession := false
@@ -250,18 +274,17 @@ func doRequestShared(api Requester, arg APIArg, req *http.Request, wantJSONRes b
 	var jsonBytes int
 	var status string
 	defer func() {
-		api.G().Log.CDebugf(ctx, "- API %s %s: err=%s, status=%q, jsonwBytes=%d", req.Method, req.URL,
-			ErrToOk(err), status, jsonBytes)
+		m.CDebugf("- API %s %s: err=%s, status=%q, jsonwBytes=%d", req.Method, req.URL, ErrToOk(err), status, jsonBytes)
 	}()
 
-	if api.G().Env.GetAPIDump() {
+	if m.G().Env.GetAPIDump() {
 		jpStr, _ := json.MarshalIndent(arg.JSONPayload, "", "  ")
 		argStr, _ := json.MarshalIndent(arg.getHTTPArgs(), "", "  ")
-		api.G().Log.CDebugf(ctx, "| full request: json:%s querystring:%s", jpStr, argStr)
+		m.CDebugf("| full request: json:%s querystring:%s", jpStr, argStr)
 	}
 
-	timer := api.G().Timers.Start(timerType)
-	internalResp, canc, err := doRetry(ctx, api, arg, cli, req)
+	timer := m.G().Timers.Start(timerType)
+	internalResp, canc, err := doRetry(m, arg, cli, req)
 
 	finisher = func() {
 		if internalResp != nil {
@@ -292,7 +315,7 @@ func doRequestShared(api Requester, arg APIArg, req *http.Request, wantJSONRes b
 	// headers. If the client is *really* out of date, the request status will
 	// be a 400 error, but these headers will still be present. So we need to
 	// handle headers *before* we abort based on status below.
-	err = api.consumeHeaders(internalResp)
+	err = api.consumeHeaders(m, internalResp, nist)
 	if err != nil {
 		return nil, finisher, nil, err
 	}
@@ -316,9 +339,9 @@ func doRequestShared(api Requester, arg APIArg, req *http.Request, wantJSONRes b
 		}
 
 		jw = jsonw.NewWrapper(obj)
-		if api.G().Env.GetAPIDump() {
+		if m.G().Env.GetAPIDump() {
 			b, _ := json.MarshalIndent(obj, "", "  ")
-			api.G().Log.CDebugf(ctx, "| full reply: %s", b)
+			m.CDebugf("| full reply: %s", b)
 		}
 	}
 
@@ -330,19 +353,19 @@ func doRequestShared(api Requester, arg APIArg, req *http.Request, wantJSONRes b
 // retry them arg.RetryCount times. It returns 3 values: the HTTP response, if all goes
 // well; a canceler function func() that the caller should call after all work is completed
 // on this request; and an error. The canceler function is to clean up the timeout.
-func doRetry(ctx context.Context, g Contextifier, arg APIArg, cli *Client, req *http.Request) (*http.Response, func(), error) {
+func doRetry(m MetaContext, arg APIArg, cli *Client, req *http.Request) (*http.Response, func(), error) {
 
 	// This serves as a proxy for checking the status of the Gregor connection. If we are not
 	// connected to Gregor, then it is likely the case we are totally offline, or on a very bad
 	// connection. If that is the case, let's make these timeouts very aggressive, so we don't
 	// block up everything trying to succeed when we probably will not.
-	if ConnectivityMonitorNo == g.G().ConnectivityMonitor.IsConnected(ctx) {
+	if ConnectivityMonitorNo == m.G().ConnectivityMonitor.IsConnected(m.Ctx()) {
 		arg.InitialTimeout = HTTPFastTimeout
 		arg.RetryCount = 0
 	}
 
 	if arg.InitialTimeout == 0 && arg.RetryCount == 0 {
-		resp, err := ctxhttp.Do(ctx, cli.cli, req)
+		resp, err := ctxhttp.Do(m.Ctx(), cli.cli, req)
 		return resp, nil, err
 	}
 
@@ -364,9 +387,9 @@ func doRetry(ctx context.Context, g Contextifier, arg APIArg, cli *Client, req *
 	var lastErr error
 	for i := 0; i < retries; i++ {
 		if i > 0 {
-			g.G().Log.CDebugf(ctx, "retry attempt %d of %d for %s", i, retries, arg.Endpoint)
+			m.CDebugf("retry attempt %d of %d for %s", i, retries, arg.Endpoint)
 		}
-		resp, canc, err := doTimeout(ctx, g, cli, req, timeout)
+		resp, canc, err := doTimeout(m, cli, req, timeout)
 		if err == nil {
 			return resp, canc, nil
 		}
@@ -374,8 +397,8 @@ func doRetry(ctx context.Context, g Contextifier, arg APIArg, cli *Client, req *
 		timeout = time.Duration(float64(timeout) * multiplier)
 
 		// If chat goes offline during this retry loop, then let's bail out early
-		if ConnectivityMonitorNo == g.G().ConnectivityMonitor.IsConnected(ctx) {
-			g.G().Log.CDebugf(ctx, "retry loop aborting since chat went offline")
+		if ConnectivityMonitorNo == m.G().ConnectivityMonitor.IsConnected(m.Ctx()) {
+			m.CDebugf("retry loop aborting since chat went offline")
 			break
 		}
 
@@ -395,8 +418,8 @@ func doRetry(ctx context.Context, g Contextifier, arg APIArg, cli *Client, req *
 // doTimeout does the http request with a timeout. It returns the response from making the HTTP request,
 // a canceler, and an error. The canceler ought to be called before the caller (or its caller) is done
 // with this request.
-func doTimeout(origCtx context.Context, g Contextifier, cli *Client, req *http.Request, timeout time.Duration) (*http.Response, func(), error) {
-	ctx, cancel := context.WithTimeout(origCtx, timeout*CITimeMultiplier(g.G()))
+func doTimeout(m MetaContext, cli *Client, req *http.Request, timeout time.Duration) (*http.Response, func(), error) {
+	ctx, cancel := context.WithTimeout(m.Ctx(), timeout*CITimeMultiplier(m.G()))
 	resp, err := ctxhttp.Do(ctx, cli.cli, req)
 	return resp, cancel, err
 }
@@ -452,31 +475,18 @@ func (a *InternalAPIEngine) getURL(arg APIArg) url.URL {
 	return u
 }
 
-func (a *InternalAPIEngine) sessionArgs(arg APIArg) (tok, csrf string, err error) {
-	if arg.SessionR != nil {
-		tok, csrf = arg.SessionR.APIArgs()
+func (a *InternalAPIEngine) sessionArgs(m MetaContext, arg APIArg) (tok, csrf string, err error) {
+	if m.apiTokener != nil {
+		m.CDebugf("Using apiTokener session and CSRF token")
+		tok, csrf = m.apiTokener.Tokens()
 		return tok, csrf, nil
 	}
 
-	a.G().LoginState().Account(func(a *Account) {
-		// since a session is required, try to load one:
-		var in bool
-		in, err = a.LoggedInLoad()
-		if err != nil {
-			return
-		}
-		if !in {
-			err = LoginRequiredError{}
-			return
-		}
-		tok, csrf = a.LocalSession().APIArgs()
-	}, "sessionArgs")
-
-	if err != nil {
-		return "", "", err
+	if tok, csrf := m.ProvisionalSessionArgs(); len(tok) > 0 && len(csrf) > 0 {
+		m.CDebugf("using provisional session args")
+		return tok, csrf, nil
 	}
-
-	return tok, csrf, nil
+	return "", "", LoginRequiredError{"no sessionArgs available since no login path worked"}
 }
 
 func (a *InternalAPIEngine) isExternal() bool { return false }
@@ -500,7 +510,7 @@ func computeCriticalClockSkew(g *GlobalContext, s string) time.Duration {
 	return ret
 }
 
-// If the local clock is within a reasonable offst of the server's
+// If the local clock is within a reasonable offset of the server's
 // clock, we'll get 0.  Otherwise, we set the skew accordingly. Safe
 // to set this every time.
 func (a *InternalAPIEngine) updateCriticalClockSkewWarning(resp *http.Response) {
@@ -518,7 +528,7 @@ func (a *InternalAPIEngine) updateCriticalClockSkewWarning(resp *http.Response) 
 	}
 }
 
-func (a *InternalAPIEngine) consumeHeaders(resp *http.Response) (err error) {
+func (a *InternalAPIEngine) consumeHeaders(m MetaContext, resp *http.Response, nist *NIST) (err error) {
 	upgradeTo := resp.Header.Get("X-Keybase-Client-Upgrade-To")
 	upgradeURI := resp.Header.Get("X-Keybase-Upgrade-URI")
 	customMessage := resp.Header.Get("X-Keybase-Upgrade-Message")
@@ -528,7 +538,21 @@ func (a *InternalAPIEngine) consumeHeaders(resp *http.Response) (err error) {
 			customMessage = string(decoded)
 		} else {
 			// If base64-decode fails, just log the error and skip decoding.
-			a.G().Log.Errorf("Failed to decode X-Keybase-Upgrade-Message header: %s", err)
+			m.CErrorf("Failed to decode X-Keybase-Upgrade-Message header: %s", err)
+		}
+	}
+
+	if nist != nil {
+		nistReply := resp.Header.Get("X-Keybase-Auth-NIST")
+		switch nistReply {
+		case "":
+		case "verified":
+			nist.MarkSuccess()
+		case "failed":
+			nist.MarkFailure()
+			m.CWarningf("NIST token failed to verify")
+		default:
+			m.CInfof("Unexpected 'X-Keybase-Auth-NIST' state: %s", nistReply)
 		}
 	}
 
@@ -536,14 +560,14 @@ func (a *InternalAPIEngine) consumeHeaders(resp *http.Response) (err error) {
 
 	if len(upgradeTo) > 0 || len(customMessage) > 0 {
 		now := time.Now()
-		g := a.G()
+		g := m.G()
 		g.oodiMu.Lock()
 		g.outOfDateInfo.UpgradeTo = upgradeTo
 		g.outOfDateInfo.UpgradeURI = upgradeURI
 		g.outOfDateInfo.CustomMessage = customMessage
 		if g.lastUpgradeWarning.IsZero() || now.Sub(*g.lastUpgradeWarning) > 3*time.Minute {
 			// Send the notification after we unlock
-			defer a.G().NotifyRouter.HandleClientOutOfDate(upgradeTo, upgradeURI, customMessage)
+			defer g.NotifyRouter.HandleClientOutOfDate(upgradeTo, upgradeURI, customMessage)
 			*g.lastUpgradeWarning = now
 		}
 		g.oodiMu.Unlock()
@@ -552,7 +576,7 @@ func (a *InternalAPIEngine) consumeHeaders(resp *http.Response) (err error) {
 		// of date, but now it doesn't. (Maybe a bad config got pushed and then
 		// later fixed.) If so, we need to clear the global outOfDateInfo, so
 		// that the client stops printing warnings.
-		g := a.G()
+		g := m.G()
 		g.oodiMu.Lock()
 		g.outOfDateInfo.UpgradeTo = ""
 		g.outOfDateInfo.UpgradeURI = ""
@@ -562,46 +586,51 @@ func (a *InternalAPIEngine) consumeHeaders(resp *http.Response) (err error) {
 	return
 }
 
-func (a *InternalAPIEngine) fixHeaders(arg APIArg, req *http.Request) error {
-	if arg.SessionType != APISessionTypeNONE {
-		tok, csrf, err := a.sessionArgs(arg)
+func (a *InternalAPIEngine) fixHeaders(m MetaContext, arg APIArg, req *http.Request, nist *NIST) error {
+
+	if nist != nil {
+		req.Header.Set("X-Keybase-Session", nist.Token().String())
+
+	} else if arg.SessionType != APISessionTypeNONE {
+		m.CDebugf("fixHeaders: falling back to legacy session management")
+		tok, csrf, err := a.sessionArgs(m, arg)
 		if err != nil {
 			if arg.SessionType == APISessionTypeREQUIRED {
-				a.G().Log.Warning("fixHeaders: session required, but error getting sessionArgs: %s", err)
+				m.CWarningf("fixHeaders: session required, but error getting sessionArgs: %s", err)
 				return err
 			}
-			a.G().Log.Debug("fixHeaders: session optional, error getting sessionArgs: %s", err)
+			m.CDebugf("fixHeaders: session optional, error getting sessionArgs: %s", err)
 		}
 
-		if a.G().Env.GetTorMode().UseSession() {
+		if m.G().Env.GetTorMode().UseSession() {
 			if len(tok) > 0 {
 				req.Header.Set("X-Keybase-Session", tok)
 			} else if arg.SessionType == APISessionTypeREQUIRED {
-				a.G().Log.Warning("fixHeaders: need session, but session token empty")
+				m.CWarningf("fixHeaders: need session, but session token empty")
 				return InternalError{Msg: "API request requires session, but session token empty"}
 			}
 		}
-		if a.G().Env.GetTorMode().UseCSRF() {
+		if m.G().Env.GetTorMode().UseCSRF() {
 			if len(csrf) > 0 {
 				req.Header.Set("X-CSRF-Token", csrf)
 			} else if arg.SessionType == APISessionTypeREQUIRED {
-				a.G().Log.Warning("fixHeaders: need session, but session csrf empty")
+				m.CWarningf("fixHeaders: need session, but session csrf empty")
 				return InternalError{Msg: "API request requires session, but session csrf empty"}
 			}
 		}
 	}
 
-	if a.G().Env.GetTorMode().UseHeaders() {
+	if m.G().Env.GetTorMode().UseHeaders() {
 		req.Header.Set("User-Agent", UserAgent)
 		identifyAs := GoClientID + " v" + VersionString() + " " + GetPlatformString()
 		req.Header.Set("X-Keybase-Client", identifyAs)
-		if a.G().Env.GetDeviceID().Exists() {
+		if m.G().Env.GetDeviceID().Exists() {
 			req.Header.Set("X-Keybase-Device-ID", a.G().Env.GetDeviceID().String())
 		}
-		if i := a.G().Env.GetInstallID(); i.Exists() {
+		if i := m.G().Env.GetInstallID(); i.Exists() {
 			req.Header.Set("X-Keybase-Install-ID", i.String())
 		}
-		if tags := LogTagsToString(arg.NetContext); tags != "" {
+		if tags := LogTagsToString(m.Ctx()); tags != "" {
 			req.Header.Set("X-Keybase-Log-Tags", tags)
 		}
 	}
@@ -630,44 +659,11 @@ func (a *InternalAPIEngine) checkAppStatus(arg APIArg, ast *AppStatus) error {
 		}
 	}
 
-	// check if there was a bad session error:
-	if err := a.checkSessionExpired(arg, ast); err != nil {
-		return err
+	if ast.Code == SCBadSession {
+		return BadSessionError{"server rejected session; is your device revoked?"}
 	}
 
 	return NewAppStatusError(ast)
-}
-
-func (a *InternalAPIEngine) checkSessionExpired(arg APIArg, ast *AppStatus) error {
-	if ast.Code != SCBadSession {
-		return nil
-	}
-
-	// if SCBadSession comes back, but no session was provided, then the session isn't invalid,
-	// the requesting code is broken.
-	if arg.SessionType == APISessionTypeNONE {
-		a.G().Log.CDebugf(arg.NetContext, "api request to %q was made with session type NONE, but api server responded with bad sesion", arg.Endpoint)
-		return fmt.Errorf("api endpoint %q requires session, APIArg for this request had session type NONE", arg.Endpoint)
-	}
-
-	var loggedIn bool
-	if arg.SessionR != nil {
-		loggedIn = arg.SessionR.IsLoggedIn()
-	} else {
-		loggedIn = a.G().LoginState().LoggedIn()
-	}
-	if !loggedIn {
-		return nil
-	}
-	a.G().Log.CDebugf(arg.NetContext, "local session -> is logged in, remote -> not logged in.  invalidating local session:")
-	if arg.SessionR != nil {
-		arg.SessionR.Invalidate()
-	} else {
-		a.G().LoginState().LocalSession(func(s *Session) { s.Invalidate() }, "api - checkSessionExpired")
-	}
-
-	// use ReloginRequiredError to signal that the session needs to be refreshed
-	return ReloginRequiredError{}
 }
 
 func (a *InternalAPIEngine) Get(arg APIArg) (*APIRes, error) {
@@ -682,13 +678,16 @@ func (a *InternalAPIEngine) Get(arg APIArg) (*APIRes, error) {
 // GetResp performs a GET request and returns the http response. The finisher
 // second arg should be called whenever we're done with the response (if it's non-nil).
 func (a *InternalAPIEngine) GetResp(arg APIArg) (*http.Response, func(), error) {
+	m := arg.GetMetaContext(a.G())
+	m = m.EnsureCtx().WithLogTag("API")
+
 	url1 := a.getURL(arg)
 	req, err := a.PrepareGet(url1, arg)
 	if err != nil {
 		return nil, noopFinisher, err
 	}
 
-	resp, finisher, _, err := doRequestShared(a, arg, req, false)
+	resp, finisher, _, err := doRequestShared(m, a, arg, req, false)
 	if err != nil {
 		return nil, finisher, err
 	}
@@ -699,35 +698,15 @@ func (a *InternalAPIEngine) GetResp(arg APIArg) (*http.Response, func(), error) 
 // GetDecode performs a GET request and decodes the response via
 // JSON into the value pointed to by v.
 func (a *InternalAPIEngine) GetDecode(arg APIArg, v APIResponseWrapper) error {
-	reqErr := a.getDecode(arg, v)
-	if reqErr == nil {
-		return nil
-	}
-
-	if err := a.refreshSession(arg, reqErr); err != nil {
-		return err
-	}
-
-	a.G().Log.CDebugf(arg.NetContext, "| API GetDecode %s session refreshed, trying again", arg.Endpoint)
-
-	reqErr = a.getDecode(arg, v)
-	if reqErr == nil {
-		a.G().Log.CDebugf(arg.NetContext, "| API GetDecode %s success after refresh", arg.Endpoint)
-		return nil
-	}
-	if _, relogin := reqErr.(ReloginRequiredError); relogin {
-		a.G().Log.CDebugf(arg.NetContext, "| API GetDecode %s retry after refresh still asking for new session, bailing out", arg.Endpoint)
-		return LoginRequiredError{Context: "your session has expired"}
-	}
-
-	a.G().Log.CDebugf(arg.NetContext, "| API GetDecode %s error after refresh: %s", arg.Endpoint, reqErr)
-	return reqErr
+	m := arg.GetMetaContext(a.G())
+	return a.getDecode(m, arg, v)
 }
 
-func (a *InternalAPIEngine) getDecode(arg APIArg, v APIResponseWrapper) error {
+func (a *InternalAPIEngine) getDecode(m MetaContext, arg APIArg, v APIResponseWrapper) error {
+	arg.MetaContext = m
 	resp, finisher, err := a.GetResp(arg)
 	if err != nil {
-		a.G().Log.CDebugf(arg.NetContext, "| API GetDecode, GetResp error: %s", err)
+		m.CDebugf("| API GetDecode, GetResp error: %s", err)
 		return err
 	}
 	defer finisher()
@@ -739,17 +718,17 @@ func (a *InternalAPIEngine) getDecode(arg APIArg, v APIResponseWrapper) error {
 		if err != nil {
 			return err
 		}
-		a.G().Log.CDebugf(arg.NetContext, "| response body: %s", string(body))
+		m.CDebugf("| response body: %s", string(body))
 		reader = bytes.NewReader(body)
 	}
 
 	dec := json.NewDecoder(reader)
 	if err = dec.Decode(&v); err != nil {
-		a.G().Log.CDebugf(arg.NetContext, "| API GetDecode, Decode error: %s", err)
+		m.CDebugf("| API GetDecode, Decode error: %s", err)
 		return err
 	}
 	if err = a.checkAppStatus(arg, v.GetAppStatus()); err != nil {
-		a.G().Log.CDebugf(arg.NetContext, "| API GetDecode, checkAppStatus error: %s", err)
+		m.CDebugf("| API GetDecode, checkAppStatus error: %s", err)
 		return err
 	}
 
@@ -773,14 +752,15 @@ func (a *InternalAPIEngine) PostJSON(arg APIArg) (*APIRes, error) {
 
 // postResp performs a POST request and returns the http response.
 // The finisher() should be called after the response is no longer needed.
-func (a *InternalAPIEngine) postResp(arg APIArg) (*http.Response, func(), error) {
+func (a *InternalAPIEngine) postResp(m MetaContext, arg APIArg) (*http.Response, func(), error) {
+	m = m.EnsureCtx().WithLogTag("API")
 	url1 := a.getURL(arg)
 	req, err := a.PrepareMethodWithBody("POST", url1, arg)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	resp, finisher, _, err := doRequestShared(a, arg, req, false)
+	resp, finisher, _, err := doRequestShared(m, a, arg, req, false)
 	if err != nil {
 		return nil, finisher, err
 	}
@@ -789,32 +769,12 @@ func (a *InternalAPIEngine) postResp(arg APIArg) (*http.Response, func(), error)
 }
 
 func (a *InternalAPIEngine) PostDecode(arg APIArg, v APIResponseWrapper) error {
-	reqErr := a.postDecode(arg, v)
-	if reqErr == nil {
-		return nil
-	}
-
-	if err := a.refreshSession(arg, reqErr); err != nil {
-		return err
-	}
-
-	a.G().Log.CDebugf(arg.NetContext, "| API PostDecode %s session refreshed, trying again", arg.Endpoint)
-	reqErr = a.postDecode(arg, v)
-	if reqErr == nil {
-		a.G().Log.CDebugf(arg.NetContext, "| API PostDecode %s success after refresh", arg.Endpoint)
-		return nil
-	}
-	if _, relogin := reqErr.(ReloginRequiredError); relogin {
-		a.G().Log.CDebugf(arg.NetContext, "| API PostDecode %s retry after refresh still asking for new session, bailing out", arg.Endpoint)
-		return LoginRequiredError{Context: "your session has expired"}
-	}
-
-	a.G().Log.CDebugf(arg.NetContext, "| API PostDecode %s error after refresh: %s", arg.Endpoint, reqErr)
-	return reqErr
+	m := arg.GetMetaContext(a.G())
+	return a.postDecode(m, arg, v)
 }
 
-func (a *InternalAPIEngine) postDecode(arg APIArg, v APIResponseWrapper) error {
-	resp, finisher, err := a.postResp(arg)
+func (a *InternalAPIEngine) postDecode(m MetaContext, arg APIArg, v APIResponseWrapper) error {
+	resp, finisher, err := a.postResp(m, arg)
 	if err != nil {
 		return err
 	}
@@ -848,70 +808,16 @@ func (a *InternalAPIEngine) Delete(arg APIArg) (*APIRes, error) {
 }
 
 func (a *InternalAPIEngine) DoRequest(arg APIArg, req *http.Request) (*APIRes, error) {
-	res, reqErr := a.doRequest(arg, req)
-	if reqErr == nil {
-		return res, nil
-	}
-
-	if err := a.refreshSession(arg, reqErr); err != nil {
-		return res, err
-	}
-
-	a.G().Log.CDebugf(arg.NetContext, "| API call %s session refreshed, trying again", arg.Endpoint)
-
-	if req.GetBody != nil {
-		// post request body consumed, need to get it back
-		var err error
-		req.Body, err = req.GetBody()
-		if err != nil {
-			return res, err
-		}
-	}
-
-	res, err := a.doRequest(arg, req)
-	if err == nil {
-		a.G().Log.CDebugf(arg.NetContext, "| API call %s success after refresh", arg.Endpoint)
-		return res, nil
-	}
-
-	if _, relogin := err.(ReloginRequiredError); relogin {
-		a.G().Log.CDebugf(arg.NetContext, "| API call %s retry after refresh still asking for new session, bailing out", arg.Endpoint)
-		return res, LoginRequiredError{Context: "your session has expired"}
-	}
-
-	a.G().Log.CDebugf(arg.NetContext, "| API call %s error after refresh: %s", arg.Endpoint, err)
-
+	m := arg.GetMetaContext(a.G())
+	m = m.EnsureCtx().WithLogTag("API")
+	res, err := a.doRequest(m, arg, req)
 	return res, err
 }
 
-func (a *InternalAPIEngine) refreshSession(arg APIArg, reqErr error) error {
-	_, relogin := reqErr.(ReloginRequiredError)
-	if !relogin {
-		return reqErr
-	}
-
-	a.G().Log.CDebugf(arg.NetContext, "| API call %s session expired, trying to refresh", arg.Endpoint)
-
-	if arg.SessionR != nil {
-		// can't re-login with a SessionR
-		return LoginRequiredError{Context: "your session has expired"}
-
-	}
-
-	username := a.G().Env.GetUsername()
-	if err := a.G().LoginState().LoginWithStoredSecret(username.String(), nil); err != nil {
-		a.G().Log.CDebugf(arg.NetContext, "| API call %s session refresh error: %s", arg.Endpoint, err)
-		return LoginRequiredError{Context: "your session has expired"}
-
-	}
-
-	a.G().Log.CDebugf(arg.NetContext, "| API call %s session refreshed", arg.Endpoint)
-	return nil
-
-}
-
-func (a *InternalAPIEngine) doRequest(arg APIArg, req *http.Request) (*APIRes, error) {
-	resp, finisher, jw, err := doRequestShared(a, arg, req, true)
+func (a *InternalAPIEngine) doRequest(m MetaContext, arg APIArg, req *http.Request) (res *APIRes, err error) {
+	m = m.EnsureCtx().WithLogTag("API")
+	defer a.G().CTraceTimed(m.Ctx(), "InternalAPIEngine#doRequest", func() error { return err })()
+	resp, finisher, jw, err := doRequestShared(m, a, arg, req, true)
 	if err != nil {
 		return nil, err
 	}
@@ -927,12 +833,12 @@ func (a *InternalAPIEngine) doRequest(arg APIArg, req *http.Request) (*APIRes, e
 	// http.AppStatus
 	appStatus, err := a.checkAppStatusFromJSONWrapper(arg, status)
 	if err != nil {
-		a.G().Log.CDebugf(arg.NetContext, "- API call %s error: %s", arg.Endpoint, err)
+		m.CDebugf("- API call %s error: %s", arg.Endpoint, err)
 		return nil, err
 	}
 
 	body := jw
-	a.G().Log.CDebugf(arg.NetContext, "- API call %s success", arg.Endpoint)
+	m.CDebugf("- API call %s success", arg.Endpoint)
 	return &APIRes{status, body, resp.StatusCode, appStatus}, err
 }
 
@@ -950,7 +856,7 @@ const (
 	XAPIResText
 )
 
-func (api *ExternalAPIEngine) fixHeaders(arg APIArg, req *http.Request) error {
+func (api *ExternalAPIEngine) fixHeaders(m MetaContext, arg APIArg, req *http.Request, nist *NIST) error {
 	// TODO (here and in the internal API engine implementation): If we don't
 	// set the User-Agent, it will default to http.defaultUserAgent
 	// ("Go-http-client/1.1"). We should think about whether that's what we
@@ -967,7 +873,7 @@ func (api *ExternalAPIEngine) fixHeaders(arg APIArg, req *http.Request) error {
 			userAgent = strings.Replace(userAgent, "android", "linux", 1)
 		}
 	}
-	if api.G().Env.GetTorMode().UseHeaders() {
+	if m.G().Env.GetTorMode().UseHeaders() {
 		req.Header.Set("User-Agent", userAgent)
 	}
 
@@ -979,7 +885,7 @@ func isReddit(req *http.Request) bool {
 	return host == "reddit.com" || strings.HasSuffix(host, ".reddit.com")
 }
 
-func (api *ExternalAPIEngine) consumeHeaders(resp *http.Response) error {
+func (api *ExternalAPIEngine) consumeHeaders(m MetaContext, resp *http.Response, nist *NIST) error {
 	return nil
 }
 
@@ -989,11 +895,14 @@ func (api *ExternalAPIEngine) DoRequest(
 	arg APIArg, req *http.Request, restype XAPIResType) (
 	ar *ExternalAPIRes, hr *ExternalHTMLRes, tr *ExternalTextRes, err error) {
 
+	m := arg.GetMetaContext(api.G())
+	m = m.EnsureCtx().WithLogTag("API")
+
 	var resp *http.Response
 	var jw *jsonw.Wrapper
 	var finisher func()
 
-	resp, finisher, jw, err = doRequestShared(api, arg, req, (restype == XAPIResJSON))
+	resp, finisher, jw, err = doRequestShared(m, api, arg, req, (restype == XAPIResJSON))
 	if err != nil {
 		return
 	}

@@ -104,10 +104,14 @@ func followSymlink(parentPath, link string) (newPath string, err error) {
 // globally; for example, a device ID combined with a local tempfile
 // name is recommended.
 func NewFS(ctx context.Context, config libkbfs.Config,
-	tlfHandle *libkbfs.TlfHandle, subdir string, uniqID string,
-	priority keybase1.MDPriority) (*FS, error) {
-	rootNode, ei, err := config.KBFSOps().GetOrCreateRootNode(
-		ctx, tlfHandle, libkbfs.MasterBranch)
+	tlfHandle *libkbfs.TlfHandle, branch libkbfs.BranchName, subdir string,
+	uniqID string, priority keybase1.MDPriority) (*FS, error) {
+	rootNodeGetter := config.KBFSOps().GetOrCreateRootNode
+	if branch != libkbfs.MasterBranch {
+		rootNodeGetter = config.KBFSOps().GetRootNode
+	}
+
+	rootNode, ei, err := rootNodeGetter(ctx, tlfHandle, branch)
 	if err != nil {
 		return nil, err
 	}
@@ -388,6 +392,24 @@ func (fs *FS) mkdirAll(filename string, perm os.FileMode) (err error) {
 	return nil
 }
 
+func (fs *FS) ensureParentDir(filename string) error {
+	err := fs.mkdirAll(path.Dir(filename), 0755)
+	if err != nil && !os.IsExist(err) {
+		switch errors.Cause(err).(type) {
+		case libkbfs.WriteAccessError, libkbfs.WriteToReadonlyNodeError:
+			// We're not allowed to create any of the parent
+			// directories automatically, so give back a proper
+			// isNotExist error.
+			fs.log.CDebugf(fs.ctx, "ensureParentDir: "+
+				"can't mkdir all due to permission error %+v", err)
+			return os.ErrNotExist
+		default:
+			return err
+		}
+	}
+	return nil
+}
+
 // OpenFile implements the billy.Filesystem interface for FS.
 func (fs *FS) OpenFile(filename string, flag int, perm os.FileMode) (
 	f billy.File, err error) {
@@ -398,19 +420,9 @@ func (fs *FS) OpenFile(filename string, flag int, perm os.FileMode) (
 		err = translateErr(err)
 	}()
 
-	err = fs.mkdirAll(path.Dir(filename), 0755)
-	if err != nil && !os.IsExist(err) {
-		switch errors.Cause(err).(type) {
-		case libkbfs.WriteAccessError, libkbfs.WriteToReadonlyNodeError:
-			// We're not allowed to create any of the parent
-			// directories automatically, so give back a proper
-			// isNotExist error.
-			fs.log.CDebugf(fs.ctx,
-				"Open can't mkdir all due to permission error %+v", err)
-			return nil, os.ErrNotExist
-		default:
-			return nil, err
-		}
+	err = fs.ensureParentDir(filename)
+	if err != nil {
+		return nil, err
 	}
 
 	n, ei, err := fs.lookupOrCreateEntry(filename, flag, perm)
@@ -611,6 +623,19 @@ func (fs *FS) Lstat(filename string) (fi os.FileInfo, err error) {
 		return nil, err
 	}
 
+	if base == "" {
+		ei, err := fs.config.KBFSOps().Stat(fs.ctx, n)
+		if err != nil {
+			return nil, err
+		}
+		return &FileInfo{
+			fs:   fs,
+			ei:   ei,
+			node: n,
+			name: "",
+		}, nil
+	}
+
 	n, ei, err := fs.config.KBFSOps().Lookup(fs.ctx, n, base)
 	if err != nil {
 		return nil, err
@@ -631,6 +656,11 @@ func (fs *FS) Symlink(target, link string) (err error) {
 		fs.deferLog.CDebugf(fs.ctx, "Symlink done: %+v", err)
 		err = translateErr(err)
 	}()
+
+	err = fs.ensureParentDir(link)
+	if err != nil {
+		return err
+	}
 
 	n, _, base, err := fs.lookupParent(link)
 	if err != nil {
@@ -827,4 +857,33 @@ func (fs *FS) ToHTTPFileSystem(ctx context.Context) http.FileSystem {
 // RootNode returns the Node of the root directory of this FS.
 func (fs *FS) RootNode() libkbfs.Node {
 	return fs.root
+}
+
+type folderHandleChangeObserver func()
+
+func (folderHandleChangeObserver) LocalChange(
+	context.Context, libkbfs.Node, libkbfs.WriteRange) {
+}
+func (folderHandleChangeObserver) BatchChanges(
+	context.Context, []libkbfs.NodeChange, []libkbfs.NodeID) {
+}
+func (o folderHandleChangeObserver) TlfHandleChange(
+	context.Context, *libkbfs.TlfHandle) {
+	o()
+}
+
+// SubscribeToObsolete returns a channel that will be closed when this *FS
+// reaches obsolescence, meaning if user of this object caches it for long term
+// use, it should invalide this entry and create a new one using NewFS.
+func (fs *FS) SubscribeToObsolete() (<-chan struct{}, error) {
+	c := make(chan struct{})
+	var once sync.Once
+	onHandleChange := folderHandleChangeObserver(
+		func() { once.Do(func() { close(c) }) })
+	if err := fs.config.Notifier().RegisterForChanges(
+		[]libkbfs.FolderBranch{fs.root.GetFolderBranch()},
+		onHandleChange); err != nil {
+		return nil, err
+	}
+	return c, nil
 }

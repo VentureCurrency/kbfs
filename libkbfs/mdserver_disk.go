@@ -38,6 +38,8 @@ type mdServerDiskShared struct {
 	// after a restart.
 	truncateLockManager  *mdServerLocalTruncateLockManager
 	implicitTeamsEnabled bool
+	// In-memory only, for now.
+	merkleRoots map[keybase1.MerkleTreeID]*kbfsmd.MerkleRoot
 
 	updateManager *mdServerLocalUpdateManager
 
@@ -78,6 +80,7 @@ func newMDServerDisk(config mdServerLocalConfig, dirPath string,
 		truncateLockManager: &truncateLockManager,
 		updateManager:       newMDServerLocalUpdateManager(),
 		shutdownFunc:        shutdownFunc,
+		merkleRoots:         make(map[keybase1.MerkleTreeID]*kbfsmd.MerkleRoot),
 	}
 	mdserv := &MDServerDisk{config, log, &shared}
 	return mdserv, nil
@@ -122,6 +125,13 @@ func (md *MDServerDisk) enableImplicitTeams() {
 	md.lock.Lock()
 	defer md.lock.Unlock()
 	md.implicitTeamsEnabled = true
+}
+
+func (md *MDServerDisk) setKbfsMerkleRoot(
+	treeID keybase1.MerkleTreeID, root *kbfsmd.MerkleRoot) {
+	md.lock.Lock()
+	defer md.lock.Unlock()
+	md.merkleRoots[treeID] = root
 }
 
 func (md *MDServerDisk) getStorage(tlfID tlf.ID) (*mdServerTlfStorage, error) {
@@ -371,6 +381,52 @@ func (md *MDServerDisk) GetForTLF(ctx context.Context, id tlf.ID,
 	}
 
 	return tlfStorage.getForTLF(ctx, session.UID, bid)
+}
+
+// GetForTLFByTime implements the MDServer interface for MDServerDisk.
+func (md *MDServerDisk) GetForTLFByTime(
+	ctx context.Context, id tlf.ID, serverTime time.Time) (
+	*RootMetadataSigned, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+
+	session, err := md.config.currentSessionGetter().GetCurrentSession(ctx)
+	if err != nil {
+		return nil, kbfsmd.ServerError{Err: err}
+	}
+
+	tlfStorage, err := md.getStorage(id)
+	if err != nil {
+		return nil, err
+	}
+
+	rmd, err := tlfStorage.getForTLF(ctx, session.UID, kbfsmd.NullBranchID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Do a linear backwards search to find the RMD that comes just
+	// before or at `serverTime`.
+	for rmd.untrustedServerTimestamp.After(serverTime) {
+		nextRev := rmd.MD.RevisionNumber() - 1
+		if nextRev == kbfsmd.RevisionUninitialized {
+			return nil, errors.Errorf(
+				"No MD found for TLF %s and serverTime %s", id, serverTime)
+		}
+		mds, err := tlfStorage.getRange(
+			ctx, session.UID, kbfsmd.NullBranchID, nextRev, nextRev)
+		if err != nil {
+			return nil, err
+		}
+		if len(mds) != 1 {
+			return nil, errors.Errorf(
+				"No MD found for TLF %s and serverTime %s", id, serverTime)
+		}
+		rmd = mds[0]
+	}
+
+	return rmd, nil
 }
 
 // GetRange implements the MDServer interface for MDServerDisk.
@@ -735,8 +791,25 @@ func (md *MDServerDisk) GetKeyBundles(ctx context.Context,
 	return tlfStorage.getKeyBundles(tlfID, wkbID, rkbID)
 }
 
-// CheckReachability implements the MDServer interface for MDServerMemory.
+// CheckReachability implements the MDServer interface for MDServerDisk.
 func (md *MDServerDisk) CheckReachability(ctx context.Context) {}
 
-// FastForwardBackoff implements the MDServer interface for MDServerMemory.
+// FastForwardBackoff implements the MDServer interface for MDServerDisk.
 func (md *MDServerDisk) FastForwardBackoff() {}
+
+// FindNextMD implements the MDServer interface for MDServerDisk.
+func (md *MDServerDisk) FindNextMD(
+	ctx context.Context, tlfID tlf.ID, rootSeqno keybase1.Seqno) (
+	nextKbfsRoot *kbfsmd.MerkleRoot, nextMerkleNodes [][]byte,
+	nextRootSeqno keybase1.Seqno, err error) {
+	return nil, nil, 0, nil
+}
+
+// GetMerkleRootLatest implements the MDServer interface for MDServerDisk.
+func (md *MDServerDisk) GetMerkleRootLatest(
+	ctx context.Context, treeID keybase1.MerkleTreeID) (
+	root *kbfsmd.MerkleRoot, err error) {
+	md.lock.RLock()
+	defer md.lock.RUnlock()
+	return md.merkleRoots[treeID], nil
+}

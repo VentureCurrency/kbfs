@@ -6,6 +6,7 @@ package libkbfs
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/logger"
@@ -15,7 +16,6 @@ import (
 	"github.com/keybase/kbfs/kbfsmd"
 	"github.com/keybase/kbfs/tlf"
 	"github.com/pkg/errors"
-
 	"golang.org/x/net/context"
 )
 
@@ -191,7 +191,7 @@ func MakeCopyWithDecryptedPrivateData(
 	pmd, err := decryptMDPrivateData(
 		ctx, config.Codec(), config.Crypto(),
 		config.BlockCache(), config.BlockOps(),
-		config.KeyManager(), config.Mode(), uid,
+		config.KeyManager(), config.KBPKI(), config.Mode(), uid,
 		irmdToDecrypt.GetSerializedPrivateMetadata(),
 		irmdToDecrypt, irmdWithKeys, config.MakeLogger(""))
 	if err != nil {
@@ -210,15 +210,9 @@ func MakeCopyWithDecryptedPrivateData(
 		irmdToDecrypt.putToServer), nil
 }
 
-// getMergedMDUpdates returns a slice of all the merged MDs for a TLF,
-// starting from the given startRev.  The returned MDs are the same
-// instances that are stored in the MD cache, so they should be
-// modified with care.
-//
-// TODO: Accept a parameter to express that we want copies of the MDs
-// instead of the cached versions.
-func getMergedMDUpdates(ctx context.Context, config Config, id tlf.ID,
-	startRev kbfsmd.Revision, lockBeforeGet *keybase1.LockID) (
+func getMergedMDUpdatesWithEnd(ctx context.Context, config Config, id tlf.ID,
+	startRev kbfsmd.Revision, endRev kbfsmd.Revision,
+	lockBeforeGet *keybase1.LockID) (
 	mergedRmds []ImmutableRootMetadata, err error) {
 	// We don't yet know about any revisions yet, so there's no range
 	// to get.
@@ -229,10 +223,27 @@ func getMergedMDUpdates(ctx context.Context, config Config, id tlf.ID,
 	start := startRev
 	for {
 		end := start + maxMDsAtATime - 1 // range is inclusive
-		rmds, err := getMDRange(ctx, config, id, kbfsmd.NullBranchID, start, end,
-			kbfsmd.Merged, lockBeforeGet)
+		if endRev != kbfsmd.RevisionUninitialized && end > endRev {
+			end = endRev
+		}
+		if end < start {
+			break
+		}
+		rmds, err := getMDRange(ctx, config, id, kbfsmd.NullBranchID,
+			start, end, kbfsmd.Merged, lockBeforeGet)
 		if err != nil {
 			return nil, err
+		}
+
+		if len(mergedRmds) > 0 && len(rmds) > 0 {
+			// Make sure the first new one is a valid successor of the
+			// last one.
+			lastRmd := mergedRmds[len(mergedRmds)-1]
+			err = lastRmd.CheckValidSuccessor(
+				lastRmd.mdID, rmds[0].ReadOnlyRootMetadata)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		mergedRmds = append(mergedRmds, rmds...)
@@ -284,6 +295,20 @@ func getMergedMDUpdates(ctx context.Context, config Config, id tlf.ID,
 	return mergedRmds, nil
 }
 
+// getMergedMDUpdates returns a slice of all the merged MDs for a TLF,
+// starting from the given startRev.  The returned MDs are the same
+// instances that are stored in the MD cache, so they should be
+// modified with care.
+//
+// TODO: Accept a parameter to express that we want copies of the MDs
+// instead of the cached versions.
+func getMergedMDUpdates(ctx context.Context, config Config, id tlf.ID,
+	startRev kbfsmd.Revision, lockBeforeGet *keybase1.LockID) (
+	mergedRmds []ImmutableRootMetadata, err error) {
+	return getMergedMDUpdatesWithEnd(
+		ctx, config, id, startRev, kbfsmd.RevisionUninitialized, lockBeforeGet)
+}
+
 // getUnmergedMDUpdates returns a slice of the unmerged MDs for a TLF
 // and unmerged branch, between the merge point for that branch and
 // startRev (inclusive).  The returned MDs are the same instances that
@@ -325,6 +350,17 @@ func getUnmergedMDUpdates(ctx context.Context, config Config, id tlf.ID,
 			return kbfsmd.RevisionUninitialized, nil, err
 		}
 
+		if len(unmergedRmds) > 0 && len(rmds) > 0 {
+			// Make sure the first old one is a valid successor of the
+			// last new one.
+			lastRmd := rmds[len(rmds)-1]
+			err = lastRmd.CheckValidSuccessor(
+				lastRmd.mdID, unmergedRmds[0].ReadOnlyRootMetadata)
+			if err != nil {
+				return kbfsmd.RevisionUninitialized, nil, err
+			}
+		}
+
 		numNew := len(rmds)
 		// prepend to keep the ordering correct
 		unmergedRmds = append(rmds, unmergedRmds...)
@@ -344,6 +380,26 @@ func getUnmergedMDUpdates(ctx context.Context, config Config, id tlf.ID,
 		}
 	}
 	return currHead, unmergedRmds, nil
+}
+
+// GetMDRevisionByTime returns the revision number of the earliest
+// merged MD of `handle` with a server timestamp greater or equal to
+// `serverTime`.
+func GetMDRevisionByTime(
+	ctx context.Context, config Config, handle *TlfHandle,
+	serverTime time.Time) (kbfsmd.Revision, error) {
+	id := handle.tlfID
+	if id == tlf.NullID {
+		return kbfsmd.RevisionUninitialized, errors.Errorf(
+			"No ID set in handle %s", handle.GetCanonicalPath())
+	}
+
+	md, err := config.MDOps().GetForTLFByTime(ctx, id, serverTime)
+	if err != nil {
+		return kbfsmd.RevisionUninitialized, err
+	}
+
+	return md.Revision(), nil
 }
 
 // encryptMDPrivateData encrypts the private data of the given
@@ -406,7 +462,7 @@ func encryptMDPrivateData(
 	return nil
 }
 
-func getFileBlockForMD(ctx context.Context, bcache BlockCache, bops BlockOps,
+func getFileBlockForMD(ctx context.Context, bcache BlockCacheSimple, bops BlockOps,
 	ptr BlockPointer, tlfID tlf.ID, rmdWithKeys KeyMetadata) (
 	*FileBlock, error) {
 	// We don't have a convenient way to fetch the block from here via
@@ -429,19 +485,20 @@ func getFileBlockForMD(ctx context.Context, bcache BlockCache, bops BlockOps,
 }
 
 func reembedBlockChanges(ctx context.Context, codec kbfscodec.Codec,
-	bcache BlockCache, bops BlockOps, mode InitMode, tlfID tlf.ID,
+	bcache BlockCacheSimple, bops BlockOps, mode InitMode, tlfID tlf.ID,
 	pmd *PrivateMetadata, rmdWithKeys KeyMetadata, log logger.Logger) error {
 	info := pmd.Changes.Info
 	if info.BlockPointer == zeroPtr {
 		return nil
 	}
 
-	if mode == InitMinimal {
+	if !mode.BlockManagementEnabled() {
 		// Leave the block changes unembedded -- they aren't needed in
 		// minimal mode since there's no node cache, and thus there
 		// are no Nodes that needs to be updated due to BlockChange
 		// pointers in those blocks.
-		log.CDebugf(ctx, "Skipping block change reembedding in mode: %s", mode)
+		log.CDebugf(ctx, "Skipping block change reembedding in mode: %s",
+			mode.Type())
 		return nil
 	}
 
@@ -473,21 +530,29 @@ func reembedBlockChanges(ctx context.Context, codec kbfscodec.Codec,
 		return err
 	}
 
-	err = codec.Decode(buf, &pmd.Changes)
+	var unembeddedChanges BlockChanges
+	err = codec.Decode(buf, &unembeddedChanges)
 	if err != nil {
 		return err
 	}
 
+	// We rely on at most one of Info or Ops being non-empty in
+	// crChains.addOps.
+	if unembeddedChanges.Info.IsInitialized() {
+		return errors.New("Unembedded BlockChangesInfo unexpectedly has an initialized Info")
+	}
+
 	// The changes block pointers are implicit ref blocks.
-	pmd.Changes.Ops[0].AddRefBlock(info.BlockPointer)
+	unembeddedChanges.Ops[0].AddRefBlock(info.BlockPointer)
 	iptrs, err := fd.getIndirectFileBlockInfos(ctx)
 	if err != nil {
 		return err
 	}
 	for _, iptr := range iptrs {
-		pmd.Changes.Ops[0].AddRefBlock(iptr.BlockPointer)
+		unembeddedChanges.Ops[0].AddRefBlock(iptr.BlockPointer)
 	}
 
+	pmd.Changes = unembeddedChanges
 	pmd.cachedChanges.Info = info
 	return nil
 }
@@ -495,8 +560,8 @@ func reembedBlockChanges(ctx context.Context, codec kbfscodec.Codec,
 // decryptMDPrivateData does not use uid if the handle is a public one.
 func decryptMDPrivateData(ctx context.Context, codec kbfscodec.Codec,
 	crypto Crypto, bcache BlockCache, bops BlockOps,
-	keyGetter mdDecryptionKeyGetter, mode InitMode, uid keybase1.UID,
-	serializedPrivateMetadata []byte,
+	keyGetter mdDecryptionKeyGetter, teamChecker kbfsmd.TeamMembershipChecker,
+	mode InitMode, uid keybase1.UID, serializedPrivateMetadata []byte,
 	rmdToDecrypt, rmdWithKeys KeyMetadata, log logger.Logger) (
 	PrivateMetadata, error) {
 	handle := rmdToDecrypt.GetTlfHandle()
@@ -519,7 +584,13 @@ func decryptMDPrivateData(ctx context.Context, codec kbfscodec.Codec,
 			rmdToDecrypt, rmdWithKeys)
 
 		if err != nil {
-			isReader := handle.IsReader(uid)
+			log.CDebugf(ctx, "Couldn't get crypt key for %s (%s): %+v",
+				handle.GetCanonicalPath(), rmdToDecrypt.TlfID(), err)
+			isReader, readerErr := isReaderFromHandle(
+				ctx, handle, teamChecker, uid)
+			if readerErr != nil {
+				return PrivateMetadata{}, readerErr
+			}
 			_, isSelfRekeyError := err.(NeedSelfRekeyError)
 			_, isOtherRekeyError := err.(NeedOtherRekeyError)
 			if isReader && (isOtherRekeyError || isSelfRekeyError) {

@@ -6,15 +6,19 @@ package libkbfs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"time"
 
+	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/go-codec/codec"
 	"github.com/keybase/kbfs/kbfscodec"
+	"github.com/keybase/kbfs/kbfscrypto"
+	"github.com/keybase/kbfs/kbfsedits"
 	"github.com/keybase/kbfs/kbfsmd"
+	"github.com/keybase/kbfs/tlf"
+	"github.com/pkg/errors"
 )
 
 // op represents a single file-system remote-sync operation
@@ -59,6 +63,12 @@ type op interface {
 	// processed/readied, at which point the real new pointer will be
 	// filled in.
 	AddSelfUpdate(ptr BlockPointer)
+
+	// ToEditNotification returns an edit notification if this op
+	// needs one, otherwise it returns nil.
+	ToEditNotification(
+		rev kbfsmd.Revision, revTime time.Time, device kbfscrypto.VerifyingKey,
+		uid keybase1.UID, tlfID tlf.ID) *kbfsedits.NotificationMessage
 }
 
 // op codes
@@ -79,8 +89,13 @@ const (
 // NOTE: Don't add or modify anything in this struct without
 // considering how old clients will handle them.
 type blockUpdate struct {
-	Unref BlockPointer `codec:"u,omitempty"`
-	Ref   BlockPointer `codec:"r,omitempty"`
+	// TODO: Ideally, we'd omit Unref or Ref if they're
+	// empty. However, we'd first have to verify that there's
+	// nothing that relies on either one of these fields to always
+	// be filled (e.g., see similar comments for the Info field on
+	// BlockChanges.)
+	Unref BlockPointer `codec:"u"`
+	Ref   BlockPointer `codec:"r"`
 }
 
 func makeBlockUpdate(unref, ref BlockPointer) (blockUpdate, error) {
@@ -108,7 +123,7 @@ func (u blockUpdate) checkValid() error {
 
 func (u *blockUpdate) setUnref(ptr BlockPointer) error {
 	if ptr == (BlockPointer{}) {
-		return fmt.Errorf("setUnref called with nil ptr")
+		return errors.Errorf("setUnref called with nil ptr")
 	}
 	u.Unref = ptr
 	return nil
@@ -116,7 +131,7 @@ func (u *blockUpdate) setUnref(ptr BlockPointer) error {
 
 func (u *blockUpdate) setRef(ptr BlockPointer) error {
 	if ptr == (BlockPointer{}) {
-		return fmt.Errorf("setRef called with nil ptr")
+		return errors.Errorf("setRef called with nil ptr")
 	}
 	u.Ref = ptr
 	return nil
@@ -263,7 +278,7 @@ func (oc *OpCommon) checkUpdatesValid() error {
 	for i, update := range oc.Updates {
 		err := update.checkValid()
 		if err != nil {
-			return fmt.Errorf(
+			return errors.Errorf(
 				"update[%d]=%v got error: %v", i, update, err)
 		}
 	}
@@ -283,6 +298,14 @@ func (oc *OpCommon) stringWithRefs(indent string) string {
 		res += indent + fmt.Sprintf("Unref[%d]: %v\n", i, unref)
 	}
 	return res
+}
+
+// ToEditNotification implements the op interface for OpCommon.
+func (oc *OpCommon) ToEditNotification(
+	_ kbfsmd.Revision, _ time.Time, _ kbfscrypto.VerifyingKey,
+	_ keybase1.UID, _ tlf.ID) *kbfsedits.NotificationMessage {
+	// Ops embedding this that can be converted should override this.
+	return nil
 }
 
 // createOp is an op representing a file or subdirectory creation
@@ -370,7 +393,7 @@ func (co *createOp) checkValid() error {
 
 	err := co.Dir.checkValid()
 	if err != nil {
-		return fmt.Errorf("createOp.Dir=%v got error: %v", co.Dir, err)
+		return errors.Errorf("createOp.Dir=%v got error: %v", co.Dir, err)
 	}
 	return co.checkUpdatesValid()
 }
@@ -470,20 +493,57 @@ func (co *createOp) getDefaultAction(mergedPath path) crAction {
 	}
 }
 
+func makeBaseEditNotification(
+	rev kbfsmd.Revision, revTime time.Time, device kbfscrypto.VerifyingKey,
+	uid keybase1.UID, tlfID tlf.ID,
+	et EntryType) kbfsedits.NotificationMessage {
+	var t kbfsedits.EntryType
+	switch et {
+	case File, Exec:
+		t = kbfsedits.EntryTypeFile
+	case Dir:
+		t = kbfsedits.EntryTypeDir
+	case Sym:
+		t = kbfsedits.EntryTypeSym
+	}
+	return kbfsedits.NotificationMessage{
+		Version:  kbfsedits.NotificationV2,
+		FileType: t,
+		Time:     revTime,
+		Revision: rev,
+		Device:   device,
+		UID:      uid,
+		FolderID: tlfID,
+	}
+}
+
+func (co *createOp) ToEditNotification(
+	rev kbfsmd.Revision, revTime time.Time, device kbfscrypto.VerifyingKey,
+	uid keybase1.UID, tlfID tlf.ID) *kbfsedits.NotificationMessage {
+	n := makeBaseEditNotification(rev, revTime, device, uid, tlfID, co.Type)
+	n.Filename = co.getFinalPath().ChildPathNoPtr(co.NewName).
+		CanonicalPathString()
+	n.Type = kbfsedits.NotificationCreate
+	return &n
+}
+
 // rmOp is an op representing a file or subdirectory removal
 type rmOp struct {
 	OpCommon
-	OldName string      `codec:"n"`
-	Dir     blockUpdate `codec:"d"`
+	OldName     string      `codec:"n"`
+	Dir         blockUpdate `codec:"d"`
+	RemovedType EntryType   `codec:"rt"`
 
 	// Indicates that the resolution process should skip this rm op.
 	// Likely indicates the rm half of a cycle-creating rename.
 	dropThis bool
 }
 
-func newRmOp(name string, oldDir BlockPointer) (*rmOp, error) {
+func newRmOp(name string, oldDir BlockPointer, removedType EntryType) (
+	*rmOp, error) {
 	ro := &rmOp{
-		OldName: name,
+		OldName:     name,
+		RemovedType: removedType,
 	}
 	err := ro.Dir.setUnref(oldDir)
 	if err != nil {
@@ -528,7 +588,7 @@ func (ro *rmOp) allUpdates() []blockUpdate {
 func (ro *rmOp) checkValid() error {
 	err := ro.Dir.checkValid()
 	if err != nil {
-		return fmt.Errorf("rmOp.Dir=%v got error: %v", ro.Dir, err)
+		return errors.Errorf("rmOp.Dir=%v got error: %v", ro.Dir, err)
 	}
 	return ro.checkUpdatesValid()
 }
@@ -572,6 +632,17 @@ func (ro *rmOp) getDefaultAction(mergedPath path) crAction {
 	return &rmMergedEntryAction{name: ro.OldName}
 }
 
+func (ro *rmOp) ToEditNotification(
+	rev kbfsmd.Revision, revTime time.Time, device kbfscrypto.VerifyingKey,
+	uid keybase1.UID, tlfID tlf.ID) *kbfsedits.NotificationMessage {
+	n := makeBaseEditNotification(
+		rev, revTime, device, uid, tlfID, ro.RemovedType)
+	n.Filename = ro.getFinalPath().ChildPathNoPtr(ro.OldName).
+		CanonicalPathString()
+	n.Type = kbfsedits.NotificationDelete
+	return &n
+}
+
 // renameOp is an op representing a rename of a file/subdirectory from
 // one directory to another.  If this is a rename within the same
 // directory, NewDir will be equivalent to blockUpdate{}.  renameOp
@@ -586,6 +657,10 @@ type renameOp struct {
 	NewDir      blockUpdate  `codec:"nd"`
 	Renamed     BlockPointer `codec:"re"`
 	RenamedType EntryType    `codec:"rt"`
+
+	// oldFinalPath is the final resolved path to the old directory
+	// containing the renamed node.  Not exported; only used locally.
+	oldFinalPath path
 }
 
 func newRenameOp(oldName string, oldOldDir BlockPointer,
@@ -657,13 +732,13 @@ func (ro *renameOp) allUpdates() []blockUpdate {
 func (ro *renameOp) checkValid() error {
 	err := ro.OldDir.checkValid()
 	if err != nil {
-		return fmt.Errorf("renameOp.OldDir=%v got error: %v",
+		return errors.Errorf("renameOp.OldDir=%v got error: %v",
 			ro.OldDir, err)
 	}
 	if ro.NewDir != (blockUpdate{}) {
 		err = ro.NewDir.checkValid()
 		if err != nil {
-			return fmt.Errorf("renameOp.NewDir=%v got error: %v",
+			return errors.Errorf("renameOp.NewDir=%v got error: %v",
 				ro.NewDir, err)
 		}
 	}
@@ -694,11 +769,26 @@ func (ro *renameOp) StringWithRefs(indent string) string {
 func (ro *renameOp) checkConflict(
 	ctx context.Context, renamer ConflictRenamer, mergedOp op,
 	isFile bool) (crAction, error) {
-	return nil, fmt.Errorf("Unexpected conflict check on a rename op: %s", ro)
+	return nil, errors.Errorf("Unexpected conflict check on a rename op: %s", ro)
 }
 
 func (ro *renameOp) getDefaultAction(mergedPath path) crAction {
 	return nil
+}
+
+func (ro *renameOp) ToEditNotification(
+	rev kbfsmd.Revision, revTime time.Time, device kbfscrypto.VerifyingKey,
+	uid keybase1.UID, tlfID tlf.ID) *kbfsedits.NotificationMessage {
+	n := makeBaseEditNotification(
+		rev, revTime, device, uid, tlfID, ro.RenamedType)
+	n.Filename = ro.getFinalPath().ChildPathNoPtr(ro.NewName).
+		CanonicalPathString()
+	n.Type = kbfsedits.NotificationRename
+	n.Params = &kbfsedits.NotificationParams{
+		OldFilename: ro.oldFinalPath.ChildPathNoPtr(ro.OldName).
+			CanonicalPathString(),
+	}
+	return &n
 }
 
 // WriteRange represents a file modification.  Len is 0 for a
@@ -824,7 +914,7 @@ func (so *syncOp) allUpdates() []blockUpdate {
 func (so *syncOp) checkValid() error {
 	err := so.File.checkValid()
 	if err != nil {
-		return fmt.Errorf("syncOp.File=%v got error: %v", so.File, err)
+		return errors.Errorf("syncOp.File=%v got error: %v", so.File, err)
 	}
 	return so.checkUpdatesValid()
 }
@@ -889,6 +979,25 @@ func (so *syncOp) getDefaultAction(mergedPath path) crAction {
 	}
 }
 
+func (so *syncOp) ToEditNotification(
+	rev kbfsmd.Revision, revTime time.Time, device kbfscrypto.VerifyingKey,
+	uid keybase1.UID, tlfID tlf.ID) *kbfsedits.NotificationMessage {
+	n := makeBaseEditNotification(rev, revTime, device, uid, tlfID, File)
+	n.Filename = so.getFinalPath().CanonicalPathString()
+	n.Type = kbfsedits.NotificationModify
+	var mods []kbfsedits.ModifyRange
+	for _, w := range so.Writes {
+		mods = append(mods, kbfsedits.ModifyRange{
+			Offset: w.Off,
+			Length: w.Len,
+		})
+	}
+	n.Params = &kbfsedits.NotificationParams{
+		Modifies: mods,
+	}
+	return &n
+}
+
 // In the functions below. a collapsed []WriteRange is a sequence of
 // non-overlapping writes with strictly increasing Off, and maybe a
 // trailing truncate (with strictly greater Off).
@@ -898,8 +1007,7 @@ func (so *syncOp) getDefaultAction(mergedPath path) crAction {
 // new write is {5, 100}, and `existingWrites` = [{7,5}, {18,10},
 // {98,10}], the returned write will be {5,103}.  There may be a
 // truncate at the end of the returned slice as well.
-func coalesceWrites(existingWrites []WriteRange,
-	wNew WriteRange) []WriteRange {
+func coalesceWrites(existingWrites []WriteRange, wNew WriteRange) []WriteRange {
 	if wNew.isTruncate() {
 		panic("coalesceWrites cannot be called with a new truncate.")
 	}
@@ -1097,7 +1205,7 @@ func (sao *setAttrOp) allUpdates() []blockUpdate {
 func (sao *setAttrOp) checkValid() error {
 	err := sao.Dir.checkValid()
 	if err != nil {
-		return fmt.Errorf("setAttrOp.Dir=%v got error: %v", sao.Dir, err)
+		return errors.Errorf("setAttrOp.Dir=%v got error: %v", sao.Dir, err)
 	}
 	return sao.checkUpdatesValid()
 }
@@ -1335,7 +1443,7 @@ func invertOpForLocalNotifications(oldOp op) (newOp op, err error) {
 	default:
 		panic(fmt.Sprintf("Unrecognized operation: %v", op))
 	case *createOp:
-		newOp, err = newRmOp(op.NewName, op.Dir.Ref)
+		newOp, err = newRmOp(op.NewName, op.Dir.Ref, op.Type)
 		if err != nil {
 			return nil, err
 		}
@@ -1376,6 +1484,8 @@ func invertOpForLocalNotifications(oldOp op) (newOp op, err error) {
 		newOp = newGCOp(op.LatestRev)
 	case *resolutionOp:
 		newOp = newResolutionOp()
+	case *rekeyOp:
+		newOp = newRekeyOp()
 	}
 
 	// Now reverse all the block updates.  Don't bother with bare Refs
@@ -1430,4 +1540,20 @@ func RegisterOps(codec kbfscodec.Codec) {
 	codec.RegisterType(reflect.TypeOf(GCOp{}), gcOpCode)
 	codec.RegisterIfaceSliceType(reflect.TypeOf(opsList{}), opsListCode,
 		opPointerizer)
+}
+
+// pathSortedOps sorts the ops in increasing order by path length, so
+// e.g. file creates come before file modifies.
+type pathSortedOps []op
+
+func (pso pathSortedOps) Len() int {
+	return len(pso)
+}
+
+func (pso pathSortedOps) Less(i, j int) bool {
+	return len(pso[i].getFinalPath().path) < len(pso[j].getFinalPath().path)
+}
+
+func (pso pathSortedOps) Swap(i, j int) {
+	pso[i], pso[j] = pso[j], pso[i]
 }

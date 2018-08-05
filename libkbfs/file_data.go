@@ -974,8 +974,6 @@ func (fd *fileData) shiftBlocksToFillHole(
 			// it as dirty.
 			rightLeafIPtr :=
 				immedParent.pblock.IPtrs[len(immedParent.pblock.IPtrs)-1]
-			fd.log.CDebugf(ctx, "Forcing %v to be dirty",
-				rightLeafIPtr.BlockPointer)
 			leafBlock, _, err := fd.getter(
 				ctx, fd.kmd, rightLeafIPtr.BlockPointer, fd.file, blockWrite)
 			if err != nil {
@@ -1096,9 +1094,9 @@ func (fd *fileData) write(ctx context.Context, data []byte, off int64,
 
 		// Take care not to write past the beginning of the next block
 		// by using max.
-		max := len(data)
+		max := int64(len(data))
 		if nextBlockOff > 0 {
-			if room := int(nextBlockOff - off); room < max {
+			if room := nextBlockOff - off; room < max {
 				max = room
 			}
 		}

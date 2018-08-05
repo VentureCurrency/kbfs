@@ -21,8 +21,8 @@ import (
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/keybase/kbfs/libfs"
 	"github.com/keybase/kbfs/libkbfs"
+	"github.com/keybase/kbfs/libmime"
 	"github.com/keybase/kbfs/libpages/config"
-	_ "github.com/keybase/kbfs/libpages/mime" // side-effects: add mime types
 	"github.com/keybase/kbfs/tlf"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/acme"
@@ -112,8 +112,12 @@ type Server struct {
 func (s *Server) getSite(ctx context.Context, root Root) (st *site, err error) {
 	siteCached, ok := s.siteCache.Get(root)
 	if ok {
-		if s, ok := siteCached.(*site); ok {
-			return s, nil
+		if st, ok := siteCached.(*site); ok {
+			if !st.fs.IsObsolete() {
+				return st, nil
+			}
+			s.config.Logger.Info("fs end of life",
+				zap.String("root", fmt.Sprintf("%#+v", root)))
 		}
 		s.config.Logger.Error("nasty entry in s.siteCache",
 			zap.String("reflect_type", reflect.TypeOf(siteCached).String()))
@@ -372,7 +376,7 @@ func (s *Server) setCommonResponseHeaders(w http.ResponseWriter) {
 	// 1-week gap before they can use HTTP again. Note that we don't use the
 	// 'preload' directive, for the same reason we use 302 instead of 301 for
 	// HTTP->HTTPS redirection. Reference: https://hstspreload.org/#opt-in
-	w.Header().Set("Strict-Transport-Security", "max-age=604800; includeSubDomains")
+	w.Header().Set("Strict-Transport-Security", "max-age=604800")
 	// TODO: allow user to opt-in some directives of Content-Security-Policy?
 }
 
@@ -458,7 +462,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var username *string
 	user, pass, ok := r.BasicAuth()
-	if ok && cfg.Authenticate(user, pass) {
+	if ok && cfg.Authenticate(r.Context(), user, pass) {
 		sri.Authenticated = true
 		username = &user
 	}
@@ -559,6 +563,8 @@ func ListenAndServe(ctx context.Context,
 	config *ServerConfig, kbfsConfig libkbfs.Config) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	libmime.Patch(nil)
 
 	server := &Server{
 		config:     config,

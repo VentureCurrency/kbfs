@@ -1004,6 +1004,17 @@ func testKeyManagerRekeyAddAndRevokeDevice(t *testing.T, ver kbfsmd.MetadataVer)
 	RevokeDeviceForLocalUserOrBust(t, config2Dev2, uid2, 0)
 	RevokeDeviceForLocalUserOrBust(t, config2Dev3, uid2, 0)
 
+	SetGlobalMerkleRootForTestOrBust(
+		t, config1, keybase1.MerkleRootV2{}, clock.Now())
+	SetGlobalMerkleRootForTestOrBust(
+		t, config2Dev2, keybase1.MerkleRootV2{}, clock.Now())
+	SetGlobalMerkleRootForTestOrBust(
+		t, config2Dev3, keybase1.MerkleRootV2{}, clock.Now())
+	SetKbfsMerkleRootForTestOrBust(
+		t, config1, keybase1.MerkleTreeID_KBFS_PRIVATE, &kbfsmd.MerkleRoot{
+			Timestamp: clock.Now().Unix(),
+		})
+
 	// First request a rekey from the new device, which will only be
 	// able to set the rekey bit (copying the root MD).
 	_, err = RequestRekeyAndWaitForOneFinishEvent(ctx,
@@ -1164,6 +1175,10 @@ func testKeyManagerRekeyAddWriterAndReaderDevice(t *testing.T, ver kbfsmd.Metada
 	err = kbfsOps1.SyncAll(ctx, rootNode1.GetFolderBranch())
 	if err != nil {
 		t.Fatalf("Couldn't sync file: %+v", err)
+	}
+	err = kbfsOps1.SyncFromServer(ctx, rootNode1.GetFolderBranch(), nil)
+	if err != nil {
+		t.Fatalf("Couldn't sync from server: %+v", err)
 	}
 
 	config2Dev2 := ConfigAsUser(config1, u2)
@@ -2049,6 +2064,13 @@ func testKeyManagerRekeyAddDeviceWithPromptAfterRestart(t *testing.T, ver kbfsmd
 	// Revoke some previous device
 	clock.Add(1 * time.Minute)
 	RevokeDeviceForLocalUserOrBust(t, config2Dev2, uid1, 0)
+
+	SetGlobalMerkleRootForTestOrBust(
+		t, config2Dev2, keybase1.MerkleRootV2{}, clock.Now())
+	SetKbfsMerkleRootForTestOrBust(
+		t, config2Dev2, keybase1.MerkleTreeID_KBFS_PRIVATE, &kbfsmd.MerkleRoot{
+			Timestamp: clock.Now().Unix(),
+		})
 
 	t.Log("Doing first rekey")
 

@@ -241,18 +241,21 @@ helpers.rootLinuxNode(env, {
 }
 
 def runNixTest(prefix) {
+    retry(5) {
+        sh 'go get -u github.com/golang/lint/golint github.com/golang/mock/gomock github.com/golang/mock/mockgen'
+    }
     tests = [:]
     // Run libkbfs tests with an in-memory bserver and mdserver, and run
     // all other tests with the tempdir bserver and mdserver.
     tests[prefix+'gofmt'] = {
         sh 'test -z $(gofmt -l $(go list ./... 2>/dev/null | grep -v /vendor/ | sed -e s/github.com.keybase.kbfs.// ))'
     }
+    tests[prefix+'notestingdep'] = {
+        // Make sure we don't accidentally pull in the testing package.
+        sh '! go list -f \'{{ join .Deps "\\n" }}\' github.com/keybase/kbfs/kbfsfuse | grep testing'
+    }
     tests[prefix+'vet'] = {
-        sh '''
-            lint=$(make -s lint);
-            echo 2>&1 "$lint";
-            [ -z "$lint" -o "$lint" = "Lint-free!" ]
-        '''
+        sh 'make -s lint'
         sh 'go vet $(go list ./... 2>/dev/null | grep -v /vendor/)'
     }
     tests[prefix+'gen_mocks'] = {
@@ -279,7 +282,14 @@ def runNixTest(prefix) {
 
     sh 'go install github.com/keybase/kbfs/...'
 
+    // Keep the list below in sync with the result of
+    //
+    //   for x in $(find . -mindepth 1 \( -wholename ./vendor -o -wholename ./.git \) -prune -o -type d -print); do [ -n "$(ls -A $x/*_test.go 2>/dev/null)" ] && echo $x; done | sort
+
     tests = [:]
+
+    // dokan is Windows-only.
+
     tests[prefix+'kbfsblock'] = {
         dir('kbfsblock') {
             sh 'go test -race -c'
@@ -289,49 +299,58 @@ def runNixTest(prefix) {
     tests[prefix+'kbfscodec'] = {
         dir('kbfscodec') {
             sh 'go test -race -c'
-            sh './kbfscodec.test -test.timeout 10m'
+            sh './kbfscodec.test -test.timeout 30s'
         }
     }
     tests[prefix+'kbfscrypto'] = {
         dir('kbfscrypto') {
             sh 'go test -race -c'
-            sh './kbfscrypto.test -test.timeout 10m'
+            sh './kbfscrypto.test -test.timeout 30s'
+        }
+    }
+    tests[prefix+'kbfsedits'] = {
+        dir('kbfsedits') {
+            sh 'go test -race -c'
+            sh './kbfsedits.test -test.timeout 30s'
+        }
+    }
+    tests[prefix+'kbfsgit'] = {
+        dir('kbfsgit') {
+            sh 'go test -race -c'
+            sh './kbfsgit.test -test.timeout 10m'
         }
     }
     tests[prefix+'kbfshash'] = {
         dir('kbfshash') {
             sh 'go test -race -c'
-            sh './kbfshash.test -test.timeout 10m'
+            sh './kbfshash.test -test.timeout 30s'
+        }
+    }
+    tests[prefix+'kbfsmd'] = {
+        dir('kbfsmd') {
+            sh 'go test -race -c'
+            sh './kbfsmd.test -test.timeout 30s'
         }
     }
     tests[prefix+'kbfssync'] = {
         dir('kbfssync') {
             sh 'go test -race -c'
-            sh './kbfssync.test -test.timeout 10m'
+            sh './kbfssync.test -test.timeout 30s'
         }
     }
-    tests[prefix+'tlf'] = {
-        dir('tlf') {
+    tests[prefix+'kbpagesconfig'] = {
+        dir('kbpagesconfig') {
             sh 'go test -race -c'
-            sh './tlf.test -test.timeout 10m'
+            sh './kbpagesconfig.test -test.timeout 30s'
         }
     }
+
+    // libdokan is Windows-only.
+
     tests[prefix+'libfs'] = {
         dir('libfs') {
             sh 'go test -race -c'
             sh './libfs.test -test.timeout 10m'
-        }
-    }
-    tests[prefix+'libgit'] = {
-        dir('libgit') {
-            sh 'go test -race -c'
-            sh './libgit.test -test.timeout 10m'
-        }
-    }
-    tests[prefix+'libkbfs'] = {
-        dir('libkbfs') {
-            sh 'go test -race -c'
-            sh './libkbfs.test -test.timeout 5m'
         }
     }
     tests[prefix+'libfuse'] = {
@@ -340,16 +359,40 @@ def runNixTest(prefix) {
             sh './libfuse.test -test.timeout 3m'
         }
     }
+    tests[prefix+'libgit'] = {
+        dir('libgit') {
+            sh 'go test -race -c'
+            sh './libgit.test -test.timeout 10m'
+        }
+    }
+    tests[prefix+'libhttpserver'] = {
+        dir('libhttpserver') {
+            sh 'go test -race -c'
+            sh './libhttpserver.test -test.timeout 30s'
+        }
+    }
+    tests[prefix+'libkbfs'] = {
+        dir('libkbfs') {
+            sh 'go test -race -c'
+            sh './libkbfs.test -test.timeout 5m'
+        }
+    }
+    tests[prefix+'libpages'] = {
+        dir('libpages') {
+            sh 'go test -race -c'
+            sh './libpages.test -test.timeout 30s'
+        }
+    }
+    tests[prefix+'libpages_config'] = {
+        dir('libpages/config') {
+            sh 'go test -race -c'
+            sh './config.test -test.timeout 30s'
+        }
+    }
     tests[prefix+'simplefs'] = {
         dir('simplefs') {
             sh 'go test -c'
             sh './simplefs.test -test.timeout 2m'
-        }
-    }
-    tests[prefix+'kbfsgit'] = {
-        dir('kbfsgit') {
-            sh 'go test -race -c'
-            sh './kbfsgit.test -test.timeout 10m'
         }
     }
     tests[prefix+'test_race'] = {
@@ -366,22 +409,10 @@ def runNixTest(prefix) {
             sh './test.fuse -test.timeout 12m'
         }
     }
-    tests[prefix+'libpages'] = {
-        dir('libpages') {
+    tests[prefix+'tlf'] = {
+        dir('tlf') {
             sh 'go test -race -c'
-            sh './libpages.test -test.timeout 30s'
-        }
-    }
-    tests[prefix+'libpages_config'] = {
-        dir('libpages/config') {
-            sh 'go test -race -c'
-            sh './config.test -test.timeout 30s'
-        }
-    }
-    tests[prefix+'kbpagesconfig'] = {
-        dir('kbpagesconfig') {
-            sh 'go test -race -c'
-            sh './kbpagesconfig.test -test.timeout 30s'
+            sh './tlf.test -test.timeout 30s'
         }
     }
     parallel (tests)

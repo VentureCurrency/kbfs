@@ -7,6 +7,7 @@ package libkbfs
 import (
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/keybase/client/go/libkb"
@@ -29,7 +30,11 @@ type KeybaseDaemonRPC struct {
 	keepAliveCancel context.CancelFunc
 
 	// protocols (additional to required protocols) to register on server connect
+	lock      sync.RWMutex
 	protocols []rpc.Protocol
+	// server is set in OnConnect. If this is non-nil, subsequent AddProtocol
+	// calls triggers a server.Register.
+	server *rpc.Server
 
 	// simplefs is the simplefs implementation used (if not nil)
 	simplefs keybase1.SimpleFSInterface
@@ -56,21 +61,36 @@ var _ KeybaseService = (*KeybaseDaemonRPC)(nil)
 
 var _ keybase1.ImplicitTeamMigrationInterface = (*KeybaseDaemonRPC)(nil)
 
+func (k *KeybaseDaemonRPC) addKBFSProtocols() {
+	// Protocols that KBFS requires
+	protocols := []rpc.Protocol{
+		keybase1.LogUiProtocol(daemonLogUI{k.daemonLog}),
+		keybase1.IdentifyUiProtocol(daemonIdentifyUI{k.daemonLog}),
+		keybase1.NotifySessionProtocol(k),
+		keybase1.NotifyKeyfamilyProtocol(k),
+		keybase1.NotifyPaperKeyProtocol(k),
+		keybase1.NotifyFSRequestProtocol(k),
+		keybase1.NotifyTeamProtocol(k),
+		keybase1.TlfKeysProtocol(k),
+		keybase1.ReachabilityProtocol(k),
+		keybase1.ImplicitTeamMigrationProtocol(k),
+	}
+
+	if k.notifyService != nil {
+		k.log.Warning("adding NotifyService protocol")
+		protocols = append(protocols, keybase1.NotifyServiceProtocol(k.notifyService))
+	}
+
+	k.AddProtocols(protocols)
+}
+
 // NewKeybaseDaemonRPC makes a new KeybaseDaemonRPC that makes RPC
 // calls using the socket of the given Keybase context.
 func NewKeybaseDaemonRPC(config Config, kbCtx Context, log logger.Logger,
-	debug bool, createSimpleFS func(Config) keybase1.SimpleFSInterface,
-	createGitHandler func(Config) keybase1.KBFSGitInterface,
-) *KeybaseDaemonRPC {
+	debug bool, additionalProtocols []rpc.Protocol) *KeybaseDaemonRPC {
 	k := newKeybaseDaemonRPC(config, kbCtx, log)
 	k.config = config
 	k.daemonLog = logger.New("daemon")
-	if createSimpleFS != nil {
-		k.simplefs = createSimpleFS(config)
-	}
-	if createGitHandler != nil {
-		k.gitHandler = createGitHandler(config)
-	}
 	if debug {
 		k.daemonLog.Configure("", true, "")
 	}
@@ -78,12 +98,15 @@ func NewKeybaseDaemonRPC(config Config, kbCtx Context, log logger.Logger,
 	k.fillClients(conn.GetClient())
 	k.shutdownFn = conn.Shutdown
 
-	if config.Mode() != InitMinimal {
+	if config.Mode().ServiceKeepaliveEnabled() {
 		ctx, cancel := context.WithCancel(context.Background())
 		k.keepAliveCancel = cancel
 		go k.keepAliveLoop(ctx)
 	}
 	k.notifyService = newNotifyServiceHandler(config, log)
+
+	k.addKBFSProtocols()
+	k.AddProtocols(additionalProtocols)
 
 	return k
 }
@@ -244,75 +267,66 @@ func (*KeybaseDaemonRPC) HandlerName() string {
 	return "KeybaseDaemonRPC"
 }
 
+func (k *KeybaseDaemonRPC) registerProtocol(server *rpc.Server, p rpc.Protocol) error {
+	k.log.Debug("registering protocol %q", p.Name)
+	err := server.Register(p)
+	switch err.(type) {
+	case nil, rpc.AlreadyRegisteredError:
+		return nil
+	default:
+		k.log.Warning("register protocol %q error", p.Name)
+		return err
+	}
+}
+
 // AddProtocols adds protocols that are registered on server connect
 func (k *KeybaseDaemonRPC) AddProtocols(protocols []rpc.Protocol) {
 	if protocols == nil {
 		return
 	}
+
+	k.lock.Lock()
+	defer k.lock.Unlock()
+
 	if k.protocols != nil {
 		k.protocols = append(k.protocols, protocols...)
 	} else {
 		k.protocols = protocols
+	}
+
+	// If we are already connected, register these protocols.
+	if k.server != nil {
+		for _, p := range protocols {
+			k.registerProtocol(k.server, p)
+		}
 	}
 }
 
 // OnConnect implements the ConnectionHandler interface.
 func (k *KeybaseDaemonRPC) OnConnect(ctx context.Context,
 	conn *rpc.Connection, rawClient rpc.GenericClient,
-	server *rpc.Server) error {
+	server *rpc.Server) (err error) {
+	k.lock.Lock()
+	defer k.lock.Unlock()
 
-	// Protocols that KBFS requires
-	protocols := []rpc.Protocol{
-		keybase1.LogUiProtocol(daemonLogUI{k.daemonLog}),
-		keybase1.IdentifyUiProtocol(daemonIdentifyUI{k.daemonLog}),
-		keybase1.NotifySessionProtocol(k),
-		keybase1.NotifyKeyfamilyProtocol(k),
-		keybase1.NotifyPaperKeyProtocol(k),
-		keybase1.NotifyFSRequestProtocol(k),
-		keybase1.NotifyTeamProtocol(k),
-		keybase1.TlfKeysProtocol(k),
-		keybase1.ReachabilityProtocol(k),
-	}
-
-	// Add simplefs if set
-	if k.simplefs != nil {
-		protocols = append(protocols, keybase1.SimpleFSProtocol(k.simplefs))
-	}
-
-	// Add git if set
-	if k.gitHandler != nil {
-		protocols = append(protocols, keybase1.KBFSGitProtocol(k.gitHandler))
-	}
-
-	if k.protocols != nil {
-		protocols = append(protocols, k.protocols...)
-	}
-
-	if k.notifyService != nil {
-		k.log.Warning("adding NotifyService protocol")
-		protocols = append(protocols, keybase1.NotifyServiceProtocol(k.notifyService))
-	}
-
-	for _, p := range protocols {
-		err := server.Register(p)
-		if err != nil {
-			if _, ok := err.(rpc.AlreadyRegisteredError); !ok {
-				return err
-			}
+	for _, p := range k.protocols {
+		if err = k.registerProtocol(server, p); err != nil {
+			return err
 		}
 	}
 
 	// Using conn.GetClient() here would cause problematic
 	// recursion.
 	c := keybase1.NotifyCtlClient{Cli: rawClient}
-	err := c.SetNotifications(ctx, keybase1.NotificationChannels{
-		Session:      true,
-		Paperkeys:    true,
-		Keyfamily:    true,
-		Kbfsrequest:  true,
-		Reachability: true,
-		Service:      true,
-		Team:         true,
+	err = c.SetNotifications(ctx, keybase1.NotificationChannels{
+		Session:       true,
+		Paperkeys:     true,
+		Keyfamily:     true,
+		Kbfsrequest:   true,
+		Reachability:  true,
+		Service:       true,
+		Team:          true,
+		Chatkbfsedits: true,
 	})
 	if err != nil {
 		return err
@@ -321,19 +335,18 @@ func (k *KeybaseDaemonRPC) OnConnect(ctx context.Context,
 	// Introduce ourselves. TODO: move this to SharedKeybaseConnection
 	// somehow?
 	configClient := keybase1.ConfigClient{Cli: rawClient}
-	ct := keybase1.ClientType_KBFS
-	if k.config.Mode() == InitSingleOp {
-		ct = keybase1.ClientType_NONE
-	}
 	err = configClient.HelloIAm(ctx, keybase1.ClientDetails{
 		Pid:        os.Getpid(),
-		ClientType: ct,
+		ClientType: k.config.Mode().ClientType(),
 		Argv:       os.Args,
 		Version:    VersionString(),
 	})
 	if err != nil {
 		return err
 	}
+
+	// Set k.server only if err == nil.
+	k.server = server
 
 	return nil
 }
@@ -358,6 +371,10 @@ func (k *KeybaseDaemonRPC) OnDisconnected(_ context.Context,
 	}
 
 	k.clearCaches()
+
+	k.lock.Lock()
+	defer k.lock.Unlock()
+	k.server = nil
 }
 
 // ShouldRetry implements the ConnectionHandler interface.
@@ -417,26 +434,16 @@ func (k *KeybaseDaemonRPC) Shutdown() {
 
 }
 
-// TeamExit (does not) implement keybase1.NotifyTeamInterface.
-func (k *KeybaseDaemonRPC) TeamExit(context.Context, keybase1.TeamID) error {
-	return nil
-}
-
-// TeamAbandoned is a placeholder for the abandoned team notification from the service.
-func (k *KeybaseDaemonRPC) TeamAbandoned(context.Context, keybase1.TeamID) error {
-	return nil
-}
-
 // notifyServiceHandler implements keybase1.NotifyServiceInterface
 type notifyServiceHandler struct {
 	config Config
 	log    logger.Logger
 }
 
-func (s *notifyServiceHandler) Shutdown(_ context.Context) error {
+func (s *notifyServiceHandler) Shutdown(_ context.Context, code int) error {
 	s.log.Warning("NotifyService: Shutdown")
 	if runtime.GOOS == "windows" {
-		os.Exit(0)
+		os.Exit(code)
 	}
 	return nil
 }

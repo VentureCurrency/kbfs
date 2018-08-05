@@ -111,8 +111,13 @@ type constMerkleRootGetter struct{}
 var _ merkleRootGetter = constMerkleRootGetter{}
 
 func (cmrg constMerkleRootGetter) GetCurrentMerkleRoot(
-	ctx context.Context) (keybase1.MerkleRootV2, error) {
-	return keybase1.MerkleRootV2{}, nil
+	ctx context.Context) (keybase1.MerkleRootV2, time.Time, error) {
+	return keybase1.MerkleRootV2{}, time.Time{}, nil
+}
+
+func (cmrg constMerkleRootGetter) VerifyMerkleRoot(
+	_ context.Context, _ keybase1.MerkleRootV2, _ keybase1.KBFSRoot) error {
+	return nil
 }
 
 func putMDRangeHelper(t testing.TB, ver kbfsmd.MetadataVer, tlfID tlf.ID,
